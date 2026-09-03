@@ -39,7 +39,10 @@ jobs:
       # -race is the point of this job. The leaderboard projection and the realtime hub are
       # concurrent by design, and a data race there is exactly the bug that passes every
       # single-threaded test.
-      - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      #
+      # -coverpkg because the integration suite lives in its own package: without it, code
+      # exercised only through those tests reports 0% and the total is meaningless.
+      - run: go test -race -covermode=atomic -coverpkg=./internal/...,./cmd/... -coverprofile=coverage.out ./...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1

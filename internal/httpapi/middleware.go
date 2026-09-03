@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -66,7 +67,7 @@ func Recoverer(next http.Handler) http.Handler {
 			}
 			// A client that disconnects mid-write makes net/http panic with this sentinel. It is
 			// not a bug and must not be logged as one.
-			if rec == http.ErrAbortHandler {
+			if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				panic(rec)
 			}
 

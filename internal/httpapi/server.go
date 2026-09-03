@@ -16,7 +16,8 @@ import (
 // ready, when non-nil, is closed once the listener is accepting connections. Tests use it to
 // avoid racing the server on startup.
 func Serve(ctx context.Context, cfg config.HTTP, log *slog.Logger, h http.Handler, ready func(addr string)) error {
-	ln, err := net.Listen("tcp", cfg.Addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}

@@ -21,6 +21,10 @@ linters:
       - path: _test\.go
         linters:
           - errcheck
+          - noctx
+      - linters:
+          - revive
+        text: "should have comment|should have a package comment"
 
 formatters:
   enable:

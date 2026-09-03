@@ -1,5 +1,14 @@
 name: podium
 
+x-app: &app
+  build:
+    context: .
+  image: podium:local
+  environment: &app-env
+    PODIUM_DATABASE_URL: postgres://podium:podium@db:5432/podium?sslmode=disable
+    PODIUM_REDIS_URL: redis://redis:6379/0
+    PODIUM_HTTP_ADDR: ":8080"
+
 services:
   db:
     image: postgres:18-alpine
@@ -28,14 +37,18 @@ services:
       timeout: 3s
       retries: 10
 
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   api:
-    build:
-      context: .
-    image: podium:local
-    environment:
-      PODIUM_DATABASE_URL: postgres://podium:podium@db:5432/podium?sslmode=disable
-      PODIUM_REDIS_URL: redis://redis:6379/0
-      PODIUM_HTTP_ADDR: ":8080"
+    <<: *app
     ports:
       - "8080:8080"
     depends_on:
@@ -43,6 +56,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

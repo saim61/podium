@@ -47,7 +47,7 @@ func TestLoggerRecordsCompletedRequest(t *testing.T) {
 
 func TestRecovererTurnsPanicIntoInternalError(t *testing.T) {
 	h := RequestID(Logger(discardLogger())(Recoverer(http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
+		func(_ http.ResponseWriter, _ *http.Request) {
 			panic("boom")
 		}))))
 
@@ -59,7 +59,7 @@ func TestRecovererTurnsPanicIntoInternalError(t *testing.T) {
 }
 
 func TestRecovererRepanicsOnAbortHandler(t *testing.T) {
-	h := Recoverer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := Recoverer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		panic(http.ErrAbortHandler)
 	}))
 
