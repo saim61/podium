@@ -35,10 +35,6 @@ func handleLive() http.HandlerFunc {
 
 // handleReady answers readiness by probing every dependency in parallel. A failure returns 503,
 // which pulls the instance out of the load balancer without killing it.
-//
-// detail controls whether dependency error text reaches the response. Outside production it is
-// what makes a failing probe diagnosable; in production it would publish internal topology to
-// anyone who can reach the endpoint.
 func handleReady(checks []Check, detail bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)

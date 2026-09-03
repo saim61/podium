@@ -50,7 +50,7 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 			reqLog.Info("request completed",
 				slog.Int("status", ww.Status()),
 				slog.Int("bytes", ww.BytesWritten()),
-				slog.Duration("duration", time.Since(start)),
+				slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000),
 			)
 		})
 	}

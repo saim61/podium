@@ -1,0 +1,48 @@
+name: podium
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: podium
+      POSTGRES_PASSWORD: podium
+      POSTGRES_DB: podium
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U podium -d podium"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+    image: podium:local
+    environment:
+      PODIUM_DATABASE_URL: postgres://podium:podium@db:5432/podium?sslmode=disable
+      PODIUM_REDIS_URL: redis://redis:6379/0
+      PODIUM_HTTP_ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

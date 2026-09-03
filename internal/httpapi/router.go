@@ -8,19 +8,15 @@ import (
 	"github.com/saim61/podium/internal/config"
 )
 
-// Deps is everything the router needs to build Podium's HTTP surface.
 type Deps struct {
 	Config config.Config
 	Logger *slog.Logger
 	Checks []Check
 }
 
-// NewRouter assembles the middleware chain and routes.
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
 
-	// Recoverer sits inside Logger so a panic is reported with the request-scoped logger and the
-	// resulting 500 is still counted in the completion line.
 	r.Use(RequestID)
 	r.Use(Logger(d.Logger))
 	r.Use(Recoverer)

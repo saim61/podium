@@ -49,7 +49,7 @@ func Serve(ctx context.Context, cfg config.HTTP, log *slog.Logger, h http.Handle
 	case <-ctx.Done():
 	}
 
-	log.Info("shutting down", slog.Duration("grace", cfg.ShutdownTimeout))
+	log.Info("shutting down", slog.String("grace", cfg.ShutdownTimeout.String()))
 
 	// A fresh context: ctx is already cancelled, and passing it to Shutdown would abandon
 	// in-flight requests immediately instead of draining them.
