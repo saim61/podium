@@ -84,6 +84,26 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 	return i, err
 }
 
+const getUserByLogin = `-- name: GetUserByLogin :one
+SELECT id, username, email, password_hash, created_at, updated_at FROM users
+WHERE lower(username) = lower($1)
+   OR lower(email) = lower($1)
+`
+
+func (q *Queries) GetUserByLogin(ctx context.Context, lower string) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByLogin, lower)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.Email,
+		&i.PasswordHash,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getUserByUsername = `-- name: GetUserByUsername :one
 SELECT id, username, email, password_hash, created_at, updated_at FROM users
 WHERE lower(username) = lower($1)
@@ -133,4 +153,21 @@ func (q *Queries) ListUsersByID(ctx context.Context, dollar_1 []int64) ([]User, 
 		return nil, err
 	}
 	return items, nil
+}
+
+const updateUserPasswordHash = `-- name: UpdateUserPasswordHash :exec
+UPDATE users
+SET password_hash = $2,
+    updated_at    = now()
+WHERE id = $1
+`
+
+type UpdateUserPasswordHashParams struct {
+	ID           int64
+	PasswordHash string
+}
+
+func (q *Queries) UpdateUserPasswordHash(ctx context.Context, arg UpdateUserPasswordHashParams) error {
+	_, err := q.db.Exec(ctx, updateUserPasswordHash, arg.ID, arg.PasswordHash)
+	return err
 }

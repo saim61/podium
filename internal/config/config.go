@@ -31,6 +31,33 @@ type Config struct {
 	Postgres Postgres
 	Redis    Redis
 	Log      Log
+	Auth     Auth
+
+	warnings []string
+}
+
+// DevJWTSecret is the signing key used when none is configured. Load rejects it in production.
+const DevJWTSecret = "podium-insecure-development-signing-key"
+
+// Auth configures credentials, tokens and login throttling.
+type Auth struct {
+	JWTSecret       string
+	Issuer          string
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
+	Argon2          Argon2
+	LoginMaxIP      int
+	LoginMaxAccount int
+	LoginWindow     time.Duration
+	TrustProxyIP    bool
+}
+
+// Argon2 holds the password hashing cost. Values are recorded in every hash, so raising them
+// later does not invalidate existing passwords.
+type Argon2 struct {
+	MemoryKiB   uint32
+	Iterations  uint32
+	Parallelism uint8
 }
 
 // HTTP configures the API listener.
@@ -100,6 +127,21 @@ func Load() (Config, error) {
 			Level:  l.level("LOG_LEVEL", slog.LevelInfo),
 			Format: Format(l.enum("LOG_FORMAT", string(FormatJSON), string(FormatJSON), string(FormatText))),
 		},
+		Auth: Auth{
+			JWTSecret:       l.str("JWT_SECRET", DevJWTSecret),
+			Issuer:          l.str("JWT_ISSUER", "podium"),
+			AccessTokenTTL:  l.duration("ACCESS_TOKEN_TTL", 15*time.Minute),
+			RefreshTokenTTL: l.duration("REFRESH_TOKEN_TTL", 720*time.Hour),
+			Argon2: Argon2{
+				MemoryKiB:   uint32(l.intRange("ARGON2_MEMORY_KIB", 65536, 8192, 1048576)),
+				Iterations:  uint32(l.intRange("ARGON2_ITERATIONS", 2, 1, 20)),
+				Parallelism: uint8(l.intRange("ARGON2_PARALLELISM", 2, 1, 64)),
+			},
+			LoginMaxIP:      l.intRange("LOGIN_MAX_PER_IP", 20, 1, 10000),
+			LoginMaxAccount: l.intRange("LOGIN_MAX_PER_ACCOUNT", 8, 1, 10000),
+			LoginWindow:     l.duration("LOGIN_WINDOW", 15*time.Minute),
+			TrustProxyIP:    l.boolean("TRUST_PROXY_IP", false),
+		},
 	}
 
 	if cfg.Postgres.MinConns > cfg.Postgres.MaxConns {
@@ -107,17 +149,59 @@ func Load() (Config, error) {
 			cfg.Postgres.MinConns, Prefix, cfg.Postgres.MaxConns))
 	}
 
+	if cfg.Env == EnvProd {
+		if cfg.Auth.JWTSecret == DevJWTSecret {
+			l.fail("JWT_SECRET", "must be set in production, not left at the development default")
+		}
+		if len(cfg.Auth.JWTSecret) < minJWTSecretLength {
+			l.fail("JWT_SECRET", fmt.Sprintf("must be at least %d characters", minJWTSecretLength))
+		}
+		if !cfg.Auth.TrustProxyIP {
+			// Not fatal: a deployment may terminate TLS itself. Worth saying out loud, because
+			// with this off behind a proxy every request appears to come from one address and
+			// per-IP login throttling silently protects nothing.
+			l.warn("TRUST_PROXY_IP is false in production; per-IP rate limits will see the " +
+				"proxy address unless Podium is directly exposed")
+		}
+	}
+
+	cfg.warnings = l.warns
+
 	if err := l.err(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
+const minJWTSecretLength = 32
+
+// Warnings returns configuration that is legal but probably a mistake.
+func (c Config) Warnings() []string { return c.warnings }
+
 // IsProd reports whether this is a production deployment.
 func (c Config) IsProd() bool { return c.Env == EnvProd }
 
 type loader struct {
-	errs []error
+	errs  []error
+	warns []string
+}
+
+func (l *loader) warn(message string) {
+	l.warns = append(l.warns, message)
+}
+
+func (l *loader) boolean(key string, def bool) bool {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		l.fail(key, fmt.Sprintf("%q is not a boolean (try true or false)", v))
+		return def
+	}
+	return parsed
 }
 
 func (l *loader) fail(key, problem string) {

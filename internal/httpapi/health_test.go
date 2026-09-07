@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/saim61/podium/internal/config"
@@ -60,6 +61,7 @@ func TestReadyProbeReportsEveryDependency(t *testing.T) {
 
 func TestReadyProbeWithholdsDetailInProduction(t *testing.T) {
 	t.Setenv("PODIUM_ENV", "prod")
+	t.Setenv("PODIUM_JWT_SECRET", strings.Repeat("s", 32))
 
 	r := testRouter(t, failing("postgres", "dial tcp 10.0.0.5:5432: connection refused"))
 

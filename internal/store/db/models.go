@@ -6,7 +6,20 @@ package db
 
 import (
 	"time"
+
+	"github.com/google/uuid"
 )
+
+type RefreshToken struct {
+	ID        int64
+	UserID    int64
+	FamilyID  uuid.UUID
+	TokenHash []byte
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+	UsedAt    *time.Time
+	RevokedAt *time.Time
+}
 
 type User struct {
 	ID           int64

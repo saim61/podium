@@ -9,11 +9,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/httpapi"
 	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/platform/postgres"
 	"github.com/saim61/podium/internal/platform/redis"
+	"github.com/saim61/podium/internal/ratelimit"
 )
 
 func main() {
@@ -36,6 +38,9 @@ func run() error {
 	defer stop()
 
 	log.Info("starting podium api", slog.String("env", string(cfg.Env)))
+	for _, warning := range cfg.Warnings() {
+		log.Warn("configuration", slog.String("detail", warning))
+	}
 
 	pool, err := postgres.Open(ctx, cfg.Postgres)
 	if err != nil {
@@ -49,9 +54,21 @@ func run() error {
 	}
 	defer func() { _ = rdb.Close() }()
 
+	authService, err := auth.NewService(pool, cfg.Auth)
+	if err != nil {
+		return err
+	}
+
+	limiter, err := ratelimit.New(rdb)
+	if err != nil {
+		return err
+	}
+
 	router := httpapi.NewRouter(httpapi.Deps{
-		Config: cfg,
-		Logger: log,
+		Config:  cfg,
+		Logger:  log,
+		Auth:    authService,
+		Limiter: limiter,
 		Checks: []httpapi.Check{
 			{Name: "postgres", Probe: pool.Ping},
 			{Name: "redis", Probe: redis.Ping(rdb)},

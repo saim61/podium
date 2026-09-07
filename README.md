@@ -5,9 +5,10 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–1 of 10 complete — configuration, structured logging, the HTTP
-> error envelope, middleware, health probes, a container stack, and the persistence layer with
-> migrations and container-backed integration tests. **80% coverage.** See [Roadmap](#roadmap).
+> **Status:** in progress. Phases 0–2 of 10 complete — configuration, structured logging, the HTTP
+> error envelope, middleware, health probes, a container stack, the persistence layer with
+> migrations, and authentication with Argon2id, JWTs and refresh token rotation with theft
+> detection. **113 tests, 80% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -103,6 +104,12 @@ default — see [`.env.example`](.env.example) for the full list with its defaul
 | `PODIUM_REDIS_URL` | local | Redis connection string. |
 | `PODIUM_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `PODIUM_LOG_FORMAT` | `json` | `json` to ship, `text` to read in a terminal. |
+| `PODIUM_JWT_SECRET` | dev key | Access token signing key. **Rejected in production** if left at the default or shorter than 32 characters. |
+| `PODIUM_ACCESS_TOKEN_TTL` | `15m` | How long an access token stays valid — and how long a logout takes to fully bite. |
+| `PODIUM_REFRESH_TOKEN_TTL` | `720h` | Session length. |
+| `PODIUM_ARGON2_MEMORY_KIB` | `65536` | Password hashing memory cost, in KiB. |
+| `PODIUM_LOGIN_MAX_PER_ACCOUNT` | `8` | Failed logins per account per window. |
+| `PODIUM_TRUST_PROXY_IP` | `false` | Whether `X-Forwarded-For` may set the client IP. |
 
 Configuration is validated once at boot, and **every** problem is reported together:
 
@@ -216,6 +223,169 @@ does not exist fails at generation time rather than in production, and there is 
 The generated structs carry no JSON tags on purpose. They are row types, not API types — letting
 them serialise directly is how `password_hash` ends up in a response body.
 
+## Authentication
+
+```
+POST /v1/auth/register   create an account and sign in
+POST /v1/auth/login      sign in with username or email
+POST /v1/auth/refresh    exchange a refresh token for a new pair
+POST /v1/auth/logout     revoke the session
+GET  /v1/me              the authenticated account
+```
+
+```bash
+curl -X POST localhost:8080/v1/auth/register -H 'content-type: application/json' \
+  -d '{"username":"saeem","email":"saeem@example.com","password":"correct horse battery"}'
+```
+
+```json
+{
+  "user": {"username": "saeem", "email": "saeem@example.com", "created_at": "..."},
+  "tokens": {
+    "access_token": "eyJhbGciOiJIUzI1NiIs...",
+    "token_type": "Bearer",
+    "expires_in": 900,
+    "refresh_token": "kQ8vX...",
+    "refresh_expires_in": 2592000
+  }
+}
+```
+
+Note what is **not** there: no numeric id. Nothing outside the server needs it, and
+[keeping it internal](#user-ids-are-bigint-not-uuids) is what makes the compact Redis identifier
+safe to use.
+
+### Passwords: Argon2id, with the cost inside the hash
+
+```
+$argon2id$v=19$m=65536,t=2,p=2$<salt>$<hash>
+```
+
+Argon2id is memory-hard, which is the property that matters: bcrypt's work factor costs an
+attacker CPU, while Argon2's memory cost denies them the GPU and ASIC parallelism that makes
+offline cracking cheap. The default here is 64 MiB per hash.
+
+Every hash carries its own salt **and its own cost parameters**. Verification reads the cost from
+the hash rather than from configuration, which is what makes the cost changeable: raising it in
+config would otherwise invalidate every existing password at once. Instead a login against a hash
+stored at an older cost succeeds and then transparently rehashes at the new one, so the fleet
+migrates itself as people sign in. There is a test that raises the cost and asserts the stored
+hash changes.
+
+### Login reveals nothing about which accounts exist
+
+Two things would otherwise leak it. Both are handled:
+
+- **The message.** "No such user" and "wrong password" return the same `401` and the same body. A
+  test asserts the two are byte-identical.
+- **The timing.** Returning early for an unknown username makes that case measurably faster than a
+  real password check — a timing oracle for valid usernames. So when the lookup misses, Podium
+  verifies the password against a decoy hash computed at startup and throws the result away. The
+  work is wasted on purpose.
+
+### Access tokens
+
+HS256 JWTs, 15 minute lifetime, carrying only the user id, issuer, expiry and a token id.
+
+HS256 rather than RS256 because one service both signs and verifies. Asymmetric keys buy the
+ability to let a third party verify without being able to mint, and there is no third party here —
+it would add key distribution and rotation for no gain.
+
+The algorithm is **pinned** at verification:
+
+```go
+jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()})
+```
+
+Without that line, a token whose header says `"alg": "none"` is accepted with no signature at all,
+and an RS256 token can be verified against the HMAC secret treated as a public key. That is the
+classic JWT algorithm confusion attack, and both variants have their own test here.
+
+### Refresh tokens: rotation with theft detection
+
+Every refresh token is **single use**. Spending one issues a new one, and every token descended
+from a single login shares a **family id**.
+
+```
+login ──► r1
+          r1 spent ──► r2
+                       r2 spent ──► r3   ← normal rotation
+```
+
+That structure is what makes stolen credentials detectable. Suppose an attacker copies `r1`:
+
+```
+attacker spends r1 ──► r2'          Podium cannot tell who this is
+victim   spends r1 ──► r1 is already used
+                        │
+                        └──► the ENTIRE family is revoked; r2' dies too
+```
+
+Presenting an already-used token means two parties hold it. Podium has no way to know which one is
+the legitimate user, so it ends the session for both and forces a fresh login — where the password
+is the deciding factor again. The alternative, ignoring the replay, silently lets a thief ride
+along indefinitely.
+
+The claim is a single conditional `UPDATE`:
+
+```sql
+UPDATE refresh_tokens SET used_at = now()
+WHERE token_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
+RETURNING *;
+```
+
+One statement, so it is atomic. Of two concurrent refreshes with the same token exactly one wins;
+the loser finds `used_at` already set and takes the theft path. Checking-then-updating in two
+statements would let both succeed under load and make the detection useless precisely when it
+matters.
+
+**The honest tradeoff:** a legitimate client that submits the same refresh token twice — two tabs
+racing, a retry after a lost response — is indistinguishable from a thief and gets logged out.
+That is the accepted cost of strict detection. Softening it with a grace window would reopen
+exactly the hole it exists to close.
+
+Tokens are stored as **SHA-256 hashes**, not Argon2. A refresh token is 256 bits from a CSPRNG, so
+there is no low-entropy guess space for a slow hash to protect — Argon2 would add its full cost to
+every refresh and buy nothing. Hashing at all is what matters: a leaked database is then not a set
+of live sessions.
+
+**What logout cannot do.** Revoking the family kills the refresh chain, but a signed JWT is
+verifiable without touching the database, so an already-issued access token keeps working until it
+expires. That is inherent to stateless tokens; the 15 minute TTL is the bound on the exposure.
+Checking a revocation list on every request would trade it away for a database read per call.
+There is a test asserting this behaviour, so it can't change silently.
+
+### Login throttling
+
+Two counters, both required:
+
+| Key | Default | Attack it stops |
+|---|---|---|
+| per IP | 20 / 15 min | one host spraying a password across many accounts |
+| per account | 8 / 15 min | a botnet grinding one account from many addresses |
+
+Either alone leaves the other attack wide open. A successful login clears both, so someone who
+mistypes twice and then gets it right is not left with a counter creeping towards a lockout.
+
+The counter is a single Lua script rather than `INCR` followed by `PEXPIRE`, because those are two
+round trips: a client that dies between them leaves a counter with **no expiry**, and that account
+is then locked out by something nothing will ever clear.
+
+Windows are fixed, not sliding, so a caller can get up to 2× the limit across a boundary. For
+making credential stuffing expensive that is a fine price for one counter and one round trip.
+
+If Redis is unreachable the limiter **fails open** — it logs and allows the request. Login
+availability matters more than the throttle, and the password check behind it is still doing the
+actual work. Failing closed would turn a cache outage into a total lockout.
+
+### Trusting proxy headers is opt-in
+
+`PODIUM_TRUST_PROXY_IP` defaults to `false`, and while it is false `X-Forwarded-For` is ignored
+entirely. Any client can set that header, so honouring it unconditionally would let an attacker
+defeat per-IP throttling by sending a fresh value on every request. Behind a real proxy you must
+turn it on — and in production Podium logs a warning when it is off, because then every request
+appears to come from the proxy and the per-IP limit silently protects nothing.
+
 ## Errors
 
 Every failure uses one envelope, so a client parses one shape:
@@ -270,8 +440,8 @@ and the headline number becomes fiction.
 |---|---|---|
 | 0 | Skeleton — config, logging, error envelope, middleware, probes, containers, CI | done |
 | 1 | Persistence — migrations, pgx pool, generated queries, container-backed tests | done |
-| 2 | Auth — register/login/refresh, Argon2id, JWT, refresh rotation with reuse detection | next |
-| 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | |
+| 2 | Auth — register/login/refresh, Argon2id, JWT, refresh rotation with reuse detection | done |
+| 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | next |
 | 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | |
 | 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | |
 | 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | |
@@ -284,8 +454,10 @@ and the headline number becomes fiction.
 ```
 cmd/api/                     the HTTP server
 cmd/migrate/                 one-shot schema migration job
+internal/auth/               Argon2id, JWTs, refresh rotation, no HTTP knowledge
 internal/config/             environment configuration, validated at boot
-internal/httpapi/            router, middleware, error envelope, health probes
+internal/httpapi/            router, middleware, error envelope, handlers, probes
+internal/ratelimit/          Redis fixed-window counters
 internal/platform/           logging, request context, Postgres and Redis clients
 internal/store/migrations/   embedded .sql migrations and the runner
 internal/store/queries/      hand-written SQL, input to sqlc
