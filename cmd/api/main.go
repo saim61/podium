@@ -11,11 +11,13 @@ import (
 
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
+	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/httpapi"
 	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/platform/postgres"
 	"github.com/saim61/podium/internal/platform/redis"
 	"github.com/saim61/podium/internal/ratelimit"
+	"github.com/saim61/podium/internal/session"
 )
 
 func main() {
@@ -64,11 +66,14 @@ func run() error {
 		return err
 	}
 
+	sessions := session.NewService(pool, games.NewRegistry())
+
 	router := httpapi.NewRouter(httpapi.Deps{
-		Config:  cfg,
-		Logger:  log,
-		Auth:    authService,
-		Limiter: limiter,
+		Config:   cfg,
+		Logger:   log,
+		Auth:     authService,
+		Sessions: sessions,
+		Limiter:  limiter,
 		Checks: []httpapi.Check{
 			{Name: "postgres", Probe: pool.Ping},
 			{Name: "redis", Probe: redis.Ping(rdb)},

@@ -10,6 +10,19 @@ import (
 	"github.com/google/uuid"
 )
 
+type GameSession struct {
+	ID         uuid.UUID
+	UserID     int64
+	Game       string
+	Seed       int64
+	State      []byte
+	Status     string
+	Moves      int32
+	StartedAt  time.Time
+	DeadlineAt *time.Time
+	FinishedAt *time.Time
+}
+
 type RefreshToken struct {
 	ID        int64
 	UserID    int64
@@ -19,6 +32,17 @@ type RefreshToken struct {
 	ExpiresAt time.Time
 	UsedAt    *time.Time
 	RevokedAt *time.Time
+}
+
+type ScoreEvent struct {
+	ID          int64
+	UserID      int64
+	SessionID   uuid.UUID
+	Game        string
+	Raw         float64
+	Points      int32
+	AchievedAt  time.Time
+	ProjectedAt *time.Time
 }
 
 type User struct {

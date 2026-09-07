@@ -2,12 +2,14 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,17 +18,63 @@ import (
 
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
+	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/httpapi"
 	"github.com/saim61/podium/internal/ratelimit"
+	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/testsupport"
 )
 
 type authHarness struct {
-	router  http.Handler
-	service *auth.Service
-	pool    *pgxpool.Pool
-	cfg     config.Config
+	router   http.Handler
+	service  *auth.Service
+	sessions *session.Service
+	pool     *pgxpool.Pool
+	cfg      config.Config
+	holds    *holdRecorder
 }
+
+// holdRecorder stands in for the delay reaction time needs. It records what the engine asked
+// for and returns immediately, so the suite does not spend three seconds per round. One test
+// uses the real timer to prove the wait genuinely happens.
+type holdRecorder struct {
+	mu        sync.Mutex
+	requested []time.Time
+	honour    bool
+}
+
+func (h *holdRecorder) sleep(ctx context.Context, until time.Time) error {
+	h.mu.Lock()
+	h.requested = append(h.requested, until)
+	honour := h.honour
+	h.mu.Unlock()
+
+	if !honour {
+		return nil
+	}
+
+	timer := time.NewTimer(time.Until(until))
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *holdRecorder) all() []time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]time.Time(nil), h.requested...)
+}
+
+type harnessOption func(*holdRecorder)
+
+// honourHolds makes the harness actually wait for a held response.
+func honourHolds(h *holdRecorder) { h.honour = true }
 
 func passwordHash(t *testing.T, pool *pgxpool.Pool, username string) string {
 	t.Helper()
@@ -37,7 +85,7 @@ func passwordHash(t *testing.T, pool *pgxpool.Pool, username string) string {
 	return hash
 }
 
-func newAuthHarness(t *testing.T) *authHarness {
+func newAuthHarness(t *testing.T, opts ...harnessOption) *authHarness {
 	t.Helper()
 
 	// Production Argon2 cost is 64 MiB per hash; at that setting this file would take minutes.
@@ -57,16 +105,26 @@ func newAuthHarness(t *testing.T) *authHarness {
 	limiter, err := ratelimit.New(rdb)
 	require.NoError(t, err)
 
+	holds := &holdRecorder{}
+	for _, opt := range opts {
+		opt(holds)
+	}
+
+	sessions := session.NewService(pool, games.NewRegistry(), session.WithSleeper(holds.sleep))
+
 	return &authHarness{
 		router: httpapi.NewRouter(httpapi.Deps{
-			Config:  cfg,
-			Logger:  slog.New(slog.NewJSONHandler(io.Discard, nil)),
-			Auth:    service,
-			Limiter: limiter,
+			Config:   cfg,
+			Logger:   slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			Auth:     service,
+			Sessions: sessions,
+			Limiter:  limiter,
 		}),
-		service: service,
-		pool:    pool,
-		cfg:     cfg,
+		service:  service,
+		sessions: sessions,
+		pool:     pool,
+		cfg:      cfg,
+		holds:    holds,
 	}
 }
 

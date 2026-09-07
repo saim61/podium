@@ -263,11 +263,23 @@ func (h *authHandler) handleMe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *authHandler) enforce(r *http.Request, w http.ResponseWriter, key string, limit int) error {
-	if h.limiter == nil {
+	return enforceLimit(r, w, h.limiter, key, limit, h.cfg.LoginWindow)
+}
+
+// enforceLimit counts one event and returns a 429 error when the caller is over its limit.
+func enforceLimit(
+	r *http.Request,
+	w http.ResponseWriter,
+	limiter *ratelimit.Limiter,
+	key string,
+	limit int,
+	window time.Duration,
+) error {
+	if limiter == nil {
 		return nil
 	}
 
-	result, err := h.limiter.Allow(r.Context(), key, limit, h.cfg.LoginWindow)
+	result, err := limiter.Allow(r.Context(), key, limit, window)
 	if err != nil {
 		// Redis being unavailable must not lock everyone out of their accounts. Log it and let
 		// the request through - availability of login matters more than the throttle, and the

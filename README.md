@@ -5,10 +5,10 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–2 of 10 complete — configuration, structured logging, the HTTP
-> error envelope, middleware, health probes, a container stack, the persistence layer with
-> migrations, and authentication with Argon2id, JWTs and refresh token rotation with theft
-> detection. **113 tests, 80% coverage.** See [Roadmap](#roadmap).
+> **Status:** in progress. Phases 0–3 of 10 complete — configuration, logging, the HTTP error
+> envelope, health probes, a container stack, persistence with migrations, authentication with
+> Argon2id and refresh token rotation, and all five games as server-authoritative state machines.
+> **280 tests, 80% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -151,6 +151,139 @@ In development that error string is the whole value of the probe. In production,
 endpoint that prints internal hostnames and ports is free reconnaissance.
 
 ---
+
+## The games
+
+Five games, each a state machine on the server. **There is no endpoint that accepts a score** —
+there is a test asserting `POST /v1/scores` returns 404, because the entire anti-forgery argument
+rests on that absence.
+
+| Slug | Game | Metric | Direction |
+|---|---|---|---|
+| `reaction` | Wait for a signal, respond. Five rounds. | milliseconds | lower |
+| `math-sprint` | Arithmetic against a 30 second clock | correct answers | higher |
+| `memory` | Repeat a growing sequence | sequence length | higher |
+| `word-scramble` | Unscramble words against a 60 second clock | words solved | higher |
+| `number-guess` | Find three numbers in 1–100 from higher/lower hints | guesses | lower |
+
+```
+POST /v1/games/{slug}/sessions   open a session
+GET  /v1/sessions/{id}           current state
+POST /v1/sessions/{id}/moves     play
+POST /v1/sessions/{id}/finish    score it
+```
+
+### State and View
+
+This split is the mechanism everything else depends on.
+
+**State** is private, stored as `jsonb`, and holds the answers — the numbers to guess, the target
+word, when the signal is due. **View** is the projection a client is allowed to see. Every engine
+produces both, and only the View is ever serialised into a response.
+
+The clearest demonstration is `number-guess`. Start a session and the client gets:
+
+```json
+{"round": 1, "rounds": 3, "low": 1, "high": 100, "guesses_used": 0, "hint": "", "done": false}
+```
+
+while the database holds `"secrets": [56, 16, 10]`. Two sessions with *different seeds* produce
+**byte-identical views** — there is a test asserting exactly that, because it proves the view
+carries no information about the answers at all.
+
+### Determinism, and why it is hashed rather than sequential
+
+Every session stores a `seed`, and all randomness derives from it:
+
+```go
+derive(seed, "math-a", index)   // sha256(seed || label || index)
+```
+
+Hashing rather than a sequential PRNG means any value can be recomputed **on its own**, without
+having generated the ones before it. Given a finished session's seed, the 40th question can be
+regenerated directly to audit what the player was actually asked. A sequential generator would
+require replaying the whole stream, and would break the moment the order of calls changed.
+
+### Deadlines belong to the server
+
+Timed games store `deadline_at` and check it against the server's clock on **every move**. A
+client that stops calling home simply stops scoring; there is no client-side timer to tamper with
+and no "time remaining" the client is trusted to report.
+
+Sessions that end early are charged for what was never played. Quitting `number-guess` after one
+guess scores the same as playing all three rounds badly, and one excellent `reaction` round
+followed by quitting is charged 500 ms for each of the four missing rounds. Without this,
+the optimal strategy on every lower-is-better game is to quit the moment you get lucky.
+
+### Reaction time and the held response
+
+`reaction` has a problem the others don't: the client must not know when the signal is due, or it
+schedules a tap for that instant and posts a perfect score.
+
+So the response *is* the signal. `{"action":"arm"}` returns nothing for 1.2–3 seconds; the moment
+it arrives is "go". The engine cannot sleep — it is a pure function — so it returns
+`Outcome{HoldUntil: t}` and the session service performs the wait. Verified live: `arm` took
+2140 ms, and `go_at` was in the database but absent from the response.
+
+Crucially the wait happens **after the transaction commits**. Sleeping inside it would hold the
+session row's lock for three seconds and stall every other request touching it.
+
+**The honest caveat:** this measures reaction time *plus* one network round trip, because the
+server timestamps both ends. Measuring on the client would be more accurate and completely
+forgeable. Given the choice, this project takes the number it can actually defend.
+
+### What this does and does not prevent
+
+It prevents **score forgery**. A client cannot submit a score, cannot see the answers, and cannot
+extend its own deadline.
+
+It does **not** prevent automation. A script can binary-search `number-guess` optimally, compute
+arithmetic instantly, and echo a `memory` sequence perfectly. Two partial mitigations exist —
+plausibility floors (a sub-80 ms reaction is charged as a foul rather than accepted as a record)
+and per-account rate limits — but a determined bot will still outplay a human. Genuinely stopping
+that needs proof-of-humanity, which is a different project.
+
+`memory` is the honest exception even to the forgery claim: the game *is* remembering a sequence,
+so the sequence must be shown. The score is still computed by the server, but the answer is
+unavoidably in the client's hands. There is a test named after this so nobody later assumes it
+behaves like the others.
+
+### Sessions
+
+One live session per game per user. Starting a second `memory` session marks the first
+`abandoned`, which bounds accumulation without needing a cleanup job. Sessions for *different*
+games coexist.
+
+`Move` locks its session row `FOR UPDATE` for the duration. Without that lock two concurrent moves
+both read the same state and the second write silently discards the first — which in `math-sprint`
+means answering twice and being credited once.
+
+`Finish` is idempotent, and the `UNIQUE` constraint on `score_events.session_id` is what makes
+that true under concurrency rather than just in the happy path. A test fires eight simultaneous
+finishes and asserts exactly one score row.
+
+Another user's session returns **404, not 403**. A distinct status would confirm the id exists,
+which turns the endpoint into a probe for other people's sessions.
+
+### Scoring
+
+Each game maps its raw metric onto a shared **0–10,000 points** scale. This is needed for the
+cross-game leaderboard to add anything together at all: 210 milliseconds and 14 solved anagrams
+have no common unit until one is invented. It also means Redis only ever stores a
+higher-is-better number, so a sorted set needs no special case for games where lower wins.
+
+The anchors are a judgement call, documented rather than hidden:
+
+| Game | 0 points | 10,000 points |
+|---|---|---|
+| `reaction` | 500 ms mean | 180 ms mean |
+| `math-sprint` | 0 correct | 30 correct |
+| `memory` | length 0 | length 12 |
+| `word-scramble` | 0 words | 15 words |
+| `number-guess` | 21 guesses | 9 guesses |
+
+`number-guess` is the most luck-dependent of the five — a fortunate first guess beats a perfect
+binary search. Three rounds instead of one reduces the variance; it does not remove it.
 
 ## Persistence
 
@@ -441,8 +574,8 @@ and the headline number becomes fiction.
 | 0 | Skeleton — config, logging, error envelope, middleware, probes, containers, CI | done |
 | 1 | Persistence — migrations, pgx pool, generated queries, container-backed tests | done |
 | 2 | Auth — register/login/refresh, Argon2id, JWT, refresh rotation with reuse detection | done |
-| 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | next |
-| 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | |
+| 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | done |
+| 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | next |
 | 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | |
 | 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | |
 | 7 | Reports and rate limiting — hot and cold period reports, token buckets | |
@@ -455,6 +588,8 @@ and the headline number becomes fiction.
 cmd/api/                     the HTTP server
 cmd/migrate/                 one-shot schema migration job
 internal/auth/               Argon2id, JWTs, refresh rotation, no HTTP knowledge
+internal/games/              the five engines, pure state machines with no I/O
+internal/session/            session lifecycle, the only place a score is written
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters

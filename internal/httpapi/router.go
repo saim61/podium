@@ -10,15 +10,17 @@ import (
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/ratelimit"
+	"github.com/saim61/podium/internal/session"
 )
 
 type Deps struct {
-	Config  config.Config
-	Logger  *slog.Logger
-	Checks  []Check
-	Auth    *auth.Service
-	Limiter *ratelimit.Limiter
-	Now     func() time.Time
+	Config   config.Config
+	Logger   *slog.Logger
+	Checks   []Check
+	Auth     *auth.Service
+	Sessions *session.Service
+	Limiter  *ratelimit.Limiter
+	Now      func() time.Time
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -47,8 +49,36 @@ func NewRouter(d Deps) http.Handler {
 	if d.Auth != nil {
 		mountAuth(r, d)
 	}
+	if d.Sessions != nil {
+		mountGames(r, d)
+	}
 
 	return r
+}
+
+func mountGames(r chi.Router, d Deps) {
+	h := &gamesHandler{
+		sessions: d.Sessions,
+		limiter:  d.Limiter,
+		cfg:      d.Config.Auth,
+	}
+
+	r.Get("/v1/games", h.handleListGames)
+	r.Get("/v1/games/{slug}", h.handleGetGame)
+
+	// Playing requires an account, because a score has to belong to somebody.
+	if d.Auth == nil {
+		return
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(Authenticate(d.Auth.Tokens()))
+
+		r.Post("/v1/games/{slug}/sessions", h.handleStartSession)
+		r.Get("/v1/sessions/{id}", h.handleGetSession)
+		r.Post("/v1/sessions/{id}/moves", h.handleMove)
+		r.Post("/v1/sessions/{id}/finish", h.handleFinish)
+	})
 }
 
 func mountAuth(r chi.Router, d Deps) {
