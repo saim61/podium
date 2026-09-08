@@ -54,3 +54,14 @@ SELECT * FROM score_events
 WHERE user_id = $1
 ORDER BY achieved_at DESC
 LIMIT $2;
+
+-- name: MarkScoreEventProjected :exec
+UPDATE score_events
+SET projected_at = now()
+WHERE id = $1;
+
+-- name: ListUnprojectedScoreEvents :many
+SELECT * FROM score_events
+WHERE projected_at IS NULL
+ORDER BY id
+LIMIT $1;

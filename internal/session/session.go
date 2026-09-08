@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/saim61/podium/internal/games"
+	"github.com/saim61/podium/internal/leaderboard"
+	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/store/db"
 )
 
@@ -42,10 +45,12 @@ type Session struct {
 	StartedAt  time.Time
 	DeadlineAt *time.Time
 	Score      *Score
+	Placement  *leaderboard.Placement
 }
 
 // Score is what a finished session earned.
 type Score struct {
+	EventID    int64
 	Game       games.Slug
 	Metric     string
 	Raw        float64
@@ -53,13 +58,19 @@ type Score struct {
 	AchievedAt time.Time
 }
 
+// Projector records a score on the leaderboards. Implemented by the leaderboard package.
+type Projector interface {
+	Submit(ctx context.Context, userID int64, game games.Slug, points int, at time.Time) (leaderboard.Placement, error)
+}
+
 // Service is the session lifecycle.
 type Service struct {
-	pool     *pgxpool.Pool
-	queries  *db.Queries
-	registry *games.Registry
-	now      func() time.Time
-	sleep    func(ctx context.Context, until time.Time) error
+	pool      *pgxpool.Pool
+	queries   *db.Queries
+	registry  *games.Registry
+	projector Projector
+	now       func() time.Time
+	sleep     func(ctx context.Context, until time.Time) error
 }
 
 // Option adjusts a Service at construction.
@@ -68,6 +79,11 @@ type Option func(*Service)
 // WithClock replaces the time source.
 func WithClock(now func() time.Time) Option {
 	return func(s *Service) { s.now = now }
+}
+
+// WithProjector attaches the leaderboards a finished score is published to.
+func WithProjector(p Projector) Option {
+	return func(s *Service) { s.projector = p }
 }
 
 // WithSleeper replaces the delay used to hold a response back. Tests use it to record what the
@@ -267,7 +283,9 @@ func (s *Service) Move(ctx context.Context, userID int64, id uuid.UUID, move jso
 		}
 	}
 
-	return sessionFrom(updated, view, score), nil
+	result := sessionFrom(updated, view, score)
+	result.Placement = s.project(ctx, updated.UserID, score)
+	return result, nil
 }
 
 // Finish ends a session and records its score. It is idempotent: finishing twice returns the
@@ -321,7 +339,37 @@ func (s *Service) Finish(ctx context.Context, userID int64, id uuid.UUID) (Sessi
 	if err := tx.Commit(ctx); err != nil {
 		return Session{}, fmt.Errorf("commit finish: %w", err)
 	}
-	return sessionFrom(finished, view, score), nil
+
+	result := sessionFrom(finished, view, score)
+	result.Placement = s.project(ctx, finished.UserID, score)
+	return result, nil
+}
+
+// project publishes a score to the leaderboards after it is durably recorded.
+//
+// A failure here is logged and swallowed. The score is already committed to Postgres, which is
+// the source of truth; the sorted sets are a projection of it. Failing the request because a
+// cache write failed would throw away a real score to protect a derived one - and the projector
+// loop sweeps anything left with projected_at still null.
+func (s *Service) project(ctx context.Context, userID int64, score *Score) *leaderboard.Placement {
+	if s.projector == nil || score == nil {
+		return nil
+	}
+
+	placement, err := s.projector.Submit(ctx, userID, score.Game, score.Points, score.AchievedAt)
+	if err != nil {
+		observability.Logger(ctx).Error("could not project score to leaderboards",
+			slog.Int64("score_event_id", score.EventID),
+			slog.Any("error", err))
+		return nil
+	}
+
+	if err := s.queries.MarkScoreEventProjected(ctx, score.EventID); err != nil {
+		observability.Logger(ctx).Error("could not mark score projected",
+			slog.Int64("score_event_id", score.EventID),
+			slog.Any("error", err))
+	}
+	return &placement
 }
 
 // settle marks a session finished and writes its score event.
@@ -387,6 +435,7 @@ func (s *Service) scoreFor(ctx context.Context, q *db.Queries, row db.GameSessio
 
 func scoreFrom(event db.ScoreEvent, definition games.Definition) *Score {
 	return &Score{
+		EventID:    event.ID,
 		Game:       games.Slug(event.Game),
 		Metric:     definition.Metric,
 		Raw:        event.Raw,

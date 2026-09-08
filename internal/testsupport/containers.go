@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
@@ -29,6 +28,11 @@ const (
 
 // One container per test binary, not per test. Starting Postgres costs seconds; isolating tests
 // by truncating tables costs milliseconds.
+//
+// Deliberately not reused across runs. testcontainers can share a named container between test
+// binaries, but its reaper tears that container down when the first binary exits - so a second
+// run, or a parallel package, connects to a port that is already closing. A few seconds of
+// startup is a fair price for a suite that does not fail at random.
 var (
 	pgOnce sync.Once
 	pgDSN  string
@@ -46,7 +50,6 @@ func postgresDSN(ctx context.Context) (string, error) {
 			tcpostgres.WithUsername("podium"),
 			tcpostgres.WithPassword("podium"),
 			tcpostgres.BasicWaitStrategies(),
-			testcontainers.WithReuseByName("podium-test-postgres"),
 		)
 		if err != nil {
 			pgErr = err
@@ -70,9 +73,7 @@ func postgresDSN(ctx context.Context) (string, error) {
 
 func redisConnURL(ctx context.Context) (string, error) {
 	redisOnce.Do(func() {
-		container, err := tcredis.Run(ctx, redisImage,
-			testcontainers.WithReuseByName("podium-test-redis"),
-		)
+		container, err := tcredis.Run(ctx, redisImage)
 		if err != nil {
 			redisErr = err
 			return

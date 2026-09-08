@@ -233,6 +233,42 @@ func (q *Queries) ListRecentScoreEventsForUser(ctx context.Context, arg ListRece
 	return items, nil
 }
 
+const listUnprojectedScoreEvents = `-- name: ListUnprojectedScoreEvents :many
+SELECT id, user_id, session_id, game, raw, points, achieved_at, projected_at FROM score_events
+WHERE projected_at IS NULL
+ORDER BY id
+LIMIT $1
+`
+
+func (q *Queries) ListUnprojectedScoreEvents(ctx context.Context, limit int32) ([]ScoreEvent, error) {
+	rows, err := q.db.Query(ctx, listUnprojectedScoreEvents, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ScoreEvent{}
+	for rows.Next() {
+		var i ScoreEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.SessionID,
+			&i.Game,
+			&i.Raw,
+			&i.Points,
+			&i.AchievedAt,
+			&i.ProjectedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockGameSession = `-- name: LockGameSession :one
 SELECT id, user_id, game, seed, state, status, moves, started_at, deadline_at, finished_at FROM game_sessions
 WHERE id = $1
@@ -255,6 +291,17 @@ func (q *Queries) LockGameSession(ctx context.Context, id uuid.UUID) (GameSessio
 		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const markScoreEventProjected = `-- name: MarkScoreEventProjected :exec
+UPDATE score_events
+SET projected_at = now()
+WHERE id = $1
+`
+
+func (q *Queries) MarkScoreEventProjected(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, markScoreEventProjected, id)
+	return err
 }
 
 const saveGameSessionState = `-- name: SaveGameSessionState :one

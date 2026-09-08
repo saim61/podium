@@ -5,10 +5,11 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–3 of 10 complete — configuration, logging, the HTTP error
+> **Status:** in progress. Phases 0–4 of 10 complete — configuration, logging, the HTTP error
 > envelope, health probes, a container stack, persistence with migrations, authentication with
-> Argon2id and refresh token rotation, and all five games as server-authoritative state machines.
-> **280 tests, 80% coverage.** See [Roadmap](#roadmap).
+> Argon2id and refresh token rotation, all five games as server-authoritative state machines, and
+> leaderboards on Redis sorted sets with atomic cross-game scoring.
+> **331 tests, 80% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -285,10 +286,136 @@ The anchors are a judgement call, documented rather than hidden:
 `number-guess` is the most luck-dependent of the five — a fortunate first guess beats a perfect
 binary search. Three rounds instead of one reduces the variance; it does not remove it.
 
+## Leaderboards
+
+```
+GET /v1/leaderboards/{game}?period=&limit=&offset=
+GET /v1/leaderboards/global?period=&limit=&offset=
+GET /v1/leaderboards/{game}/me?neighbours=      (needs a token)
+GET /v1/leaderboards/global/me?neighbours=      (needs a token)
+```
+
+Reading a board needs no account — it is the public face of the product. Only "where am I" needs
+to know who is asking.
+
+```json
+{
+  "scope": "memory", "period": "all-time", "total": 3, "offset": 0,
+  "entries": [
+    {"rank": 1, "username": "alice", "points": 5833},
+    {"rank": 2, "username": "carol", "points": 3333},
+    {"rank": 2, "username": "bob",   "points": 3333}
+  ]
+}
+```
+
+### 24 sorted sets
+
+**Every game gets its own board**, over four windows — 5 × 4 = 20 sets. Four more hold the
+cross-game total.
+
+```
+lb:g:memory:all           lb:global:all
+lb:g:memory:d:2026-09-07  lb:global:d:2026-09-07
+lb:g:memory:w:2026-W37    lb:global:w:2026-W37
+lb:g:memory:m:2026-09     lb:global:m:2026-09
+```
+
+The per-game boards are the authoritative rankings, because a game's own metric needs no
+conversion. The global set sits on top as an explicitly **derived** breadth score: a game entry
+holds a player's *best*, and the global entry is the *sum of their bests across all five games*.
+Playing everything therefore beats mastering one thing, which is a deliberate choice rather than
+a consequence.
+
+Windows are bucketed in **UTC** and keyed by the bucket itself, so a rollover needs no job — the
+new day simply writes to a new key. Period keys carry a TTL (48 h, 14 d, 62 d); the all-time keys
+never expire. Postgres keeps every score forever, so a window older than its TTL is served from
+there instead.
+
+### submit.lua, and why it has to be one script
+
+Recording a score is a read-modify-write across **eight keys**:
+
+```lua
+local previous = redis.call('ZSCORE', game_key, member)
+if points > previous then
+    redis.call('ZADD', game_key, points, member)
+    redis.call('ZINCRBY', global_key, points - previous, member)   -- the delta, not the score
+end
+```
+
+The global total moves by `points - previous`, because it is a *sum*. Split across round trips,
+two concurrent submissions both read the same `previous` and both add their own delta — and the
+global score inflates permanently, with nothing to detect it.
+
+That is not theoretical. A deliberately non-atomic version of this exact logic was raced with 400
+concurrent submissions across six players, and every single player's global total was wrong:
+
+```
+user 1: per-game sum 45828, global 70708, drift +24880
+user 2: per-game sum 47558, global 98323, drift +50765
+user 3: per-game sum 42711, global 77960, drift +35249
+```
+
+Inflation of 40–100%. Redis runs a script to completion with nothing interleaved, which is what
+makes the arithmetic hold. `TestConcurrentSubmissionsKeepGlobalConsistent` runs the same 400
+submissions against the real implementation and asserts, for every player and every period, that
+the global score equals the sum of their per-game bests.
+
+TTLs are set inside the script too, but **only when a key has none yet**. Setting them on every
+write would slide the window forward forever and a daily board would never roll over for an
+active player.
+
+### Ranks are competition ranks
+
+```
+rank(player) = ZCOUNT(key, "(" .. score, "+inf") + 1
+```
+
+The number of players scoring strictly higher, plus one. Everyone tied on a score therefore
+**shares** a rank and the next distinct score skips the places they occupy — 1, 2, 2, 4 — which is
+how a scoreboard is normally read. `ZREVRANK` would instead hand out 1, 2, 3, 4 and silently break
+ties by whichever user id sorts first.
+
+A page needs exactly **one** `ZCOUNT`, not one per row. Because the page is contiguous and
+descending, a score's first occurrence sits at its own position, so its rank is that position plus
+one. Only the first row can begin part way through a tie, so only it needs asking — there is a
+test for a page that opens mid-tie, since that is the case the shortcut has to get right.
+
+**A deviation from the plan, and why.** The plan called for breaking ties by who reached the score
+first, joining `achieved_at` from Postgres on every page. That was dropped. Tied players already
+share a rank, so the order *within* a tie carries no ranking meaning — and paying a Postgres query
+on the hot read path to reorder rows that are declared equal anyway is the wrong trade in a system
+whose whole point is fast reads. The alternative of packing an inverted timestamp into the float
+score was also rejected: it spends mantissa bits and breaks the `ZINCRBY` delta arithmetic the
+global set depends on.
+
+### Names, not ids
+
+Sorted sets store **user ids** because ids are small and stable — the reason ids are `bigint` and
+not UUIDs. A page therefore arrives as numbers and needs names attached: one batched lookup,
+cached in Redis under `user:name:{id}` for an hour. Never a query per row.
+
+Because entries are keyed by id and resolved to the *current* username at read time, a rename is
+reflected across every historical board for free.
+
+### Projection is best effort
+
+```
+finish session
+  ├─ tx: INSERT score_events            ← durable, authoritative
+  └─ EVALSHA submit.lua                 ← derived, best effort
+       └─ on success: stamp projected_at
+```
+
+If Redis is unreachable the score is **still recorded and the request still succeeds**. The
+leaderboard is a projection; failing a real score to protect a derived one would be backwards. The
+row keeps `projected_at IS NULL`, and phase 5's sweeper picks it up.
+
 ## Persistence
 
-Postgres is the source of truth. Redis, once the leaderboards arrive in phase 4, holds only a
-projection of it.
+Postgres is the source of truth. Redis holds only a projection of it — every entry above can be
+rebuilt from `score_events`.
 
 ### Migrations run as a job, never on boot
 
@@ -575,8 +702,8 @@ and the headline number becomes fiction.
 | 1 | Persistence — migrations, pgx pool, generated queries, container-backed tests | done |
 | 2 | Auth — register/login/refresh, Argon2id, JWT, refresh rotation with reuse detection | done |
 | 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | done |
-| 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | next |
-| 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | |
+| 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | done |
+| 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | next |
 | 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | |
 | 7 | Reports and rate limiting — hot and cold period reports, token buckets | |
 | 8 | Demo UI — play all five games, watch ranks reorder live | |
@@ -590,6 +717,8 @@ cmd/migrate/                 one-shot schema migration job
 internal/auth/               Argon2id, JWTs, refresh rotation, no HTTP knowledge
 internal/games/              the five engines, pure state machines with no I/O
 internal/session/            session lifecycle, the only place a score is written
+internal/leaderboard/        sorted sets, submit.lua, ranks and paging
+internal/user/               username lookups for leaderboard hydration
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters

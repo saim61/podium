@@ -13,6 +13,7 @@ import (
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/games"
+	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/ratelimit"
 	"github.com/saim61/podium/internal/session"
 )
@@ -49,15 +50,22 @@ type scoreResponse struct {
 	AchievedAt time.Time  `json:"achieved_at"`
 }
 
+type placementResponse struct {
+	Improved bool                                        `json:"improved"`
+	Game     map[leaderboard.Period]leaderboard.Standing `json:"game"`
+	Global   map[leaderboard.Period]leaderboard.Standing `json:"global"`
+}
+
 type sessionResponse struct {
-	ID         uuid.UUID       `json:"id"`
-	Game       games.Slug      `json:"game"`
-	Status     string          `json:"status"`
-	Moves      int             `json:"moves"`
-	StartedAt  time.Time       `json:"started_at"`
-	DeadlineAt *time.Time      `json:"deadline_at,omitempty"`
-	State      json.RawMessage `json:"state"`
-	Score      *scoreResponse  `json:"score,omitempty"`
+	ID         uuid.UUID          `json:"id"`
+	Game       games.Slug         `json:"game"`
+	Status     string             `json:"status"`
+	Moves      int                `json:"moves"`
+	StartedAt  time.Time          `json:"started_at"`
+	DeadlineAt *time.Time         `json:"deadline_at,omitempty"`
+	State      json.RawMessage    `json:"state"`
+	Score      *scoreResponse     `json:"score,omitempty"`
+	Placement  *placementResponse `json:"placement,omitempty"`
 }
 
 // newSessionResponse renders a session. The "state" field carries the engine's View - the
@@ -80,6 +88,14 @@ func newSessionResponse(s session.Session) sessionResponse {
 			Raw:        s.Score.Raw,
 			Points:     s.Score.Points,
 			AchievedAt: s.Score.AchievedAt,
+		}
+	}
+
+	if s.Placement != nil {
+		response.Placement = &placementResponse{
+			Improved: s.Placement.Improved[leaderboard.AllTime],
+			Game:     s.Placement.Game,
+			Global:   s.Placement.Global,
 		}
 	}
 	return response

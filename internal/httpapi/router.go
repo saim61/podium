@@ -9,18 +9,20 @@ import (
 
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
+	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/ratelimit"
 	"github.com/saim61/podium/internal/session"
 )
 
 type Deps struct {
-	Config   config.Config
-	Logger   *slog.Logger
-	Checks   []Check
-	Auth     *auth.Service
-	Sessions *session.Service
-	Limiter  *ratelimit.Limiter
-	Now      func() time.Time
+	Config      config.Config
+	Logger      *slog.Logger
+	Checks      []Check
+	Auth        *auth.Service
+	Sessions    *session.Service
+	Leaderboard *leaderboard.Board
+	Limiter     *ratelimit.Limiter
+	Now         func() time.Time
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -52,8 +54,32 @@ func NewRouter(d Deps) http.Handler {
 	if d.Sessions != nil {
 		mountGames(r, d)
 	}
+	if d.Leaderboard != nil && d.Sessions != nil {
+		mountLeaderboards(r, d)
+	}
 
 	return r
+}
+
+func mountLeaderboards(r chi.Router, d Deps) {
+	h := &leaderboardHandler{board: d.Leaderboard, sessions: d.Sessions}
+
+	// Reading a leaderboard needs no account. It is the public face of the product, and
+	// requiring a login to see who is winning would be an odd choice.
+	r.Get("/v1/leaderboards/global", h.handleGlobalPage)
+	r.Get("/v1/leaderboards/{game}", h.handleGamePage)
+
+	if d.Auth == nil {
+		return
+	}
+
+	// "Where am I" needs to know who is asking.
+	r.Group(func(r chi.Router) {
+		r.Use(Authenticate(d.Auth.Tokens()))
+
+		r.Get("/v1/leaderboards/global/me", h.handleGlobalStanding)
+		r.Get("/v1/leaderboards/{game}/me", h.handleGameStanding)
+	})
 }
 
 func mountGames(r chi.Router, d Deps) {

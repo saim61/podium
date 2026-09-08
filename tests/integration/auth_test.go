@@ -20,15 +20,18 @@ import (
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/httpapi"
+	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/ratelimit"
 	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/testsupport"
+	"github.com/saim61/podium/internal/user"
 )
 
 type authHarness struct {
 	router   http.Handler
 	service  *auth.Service
 	sessions *session.Service
+	board    *leaderboard.Board
 	pool     *pgxpool.Pool
 	cfg      config.Config
 	holds    *holdRecorder
@@ -110,18 +113,25 @@ func newAuthHarness(t *testing.T, opts ...harnessOption) *authHarness {
 		opt(holds)
 	}
 
-	sessions := session.NewService(pool, games.NewRegistry(), session.WithSleeper(holds.sleep))
+	board, err := leaderboard.New(rdb, user.NewDirectory(pool))
+	require.NoError(t, err)
+
+	sessions := session.NewService(pool, games.NewRegistry(),
+		session.WithSleeper(holds.sleep),
+		session.WithProjector(board))
 
 	return &authHarness{
 		router: httpapi.NewRouter(httpapi.Deps{
-			Config:   cfg,
-			Logger:   slog.New(slog.NewJSONHandler(io.Discard, nil)),
-			Auth:     service,
-			Sessions: sessions,
-			Limiter:  limiter,
+			Config:      cfg,
+			Logger:      slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			Auth:        service,
+			Sessions:    sessions,
+			Leaderboard: board,
+			Limiter:     limiter,
 		}),
 		service:  service,
 		sessions: sessions,
+		board:    board,
 		pool:     pool,
 		cfg:      cfg,
 		holds:    holds,
