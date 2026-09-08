@@ -63,7 +63,7 @@ func run() error {
 		return err
 	}
 
-	limiter, err := ratelimit.New(rdb)
+	limiter, err := ratelimit.New(rdb, cfg.Redis.OpTimeout)
 	if err != nil {
 		return err
 	}
@@ -73,7 +73,9 @@ func run() error {
 		return err
 	}
 
-	sessions := session.NewService(pool, games.NewRegistry(), session.WithProjector(board))
+	sessions := session.NewService(pool, games.NewRegistry(),
+		session.WithProjector(board),
+		session.WithProjectTimeout(cfg.Redis.OpTimeout))
 
 	router := httpapi.NewRouter(httpapi.Deps{
 		Config:      cfg,

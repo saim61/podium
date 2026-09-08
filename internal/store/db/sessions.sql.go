@@ -34,6 +34,61 @@ func (q *Queries) AbandonActiveSessions(ctx context.Context, arg AbandonActiveSe
 	return result.RowsAffected(), nil
 }
 
+const abandonStaleSessions = `-- name: AbandonStaleSessions :execrows
+UPDATE game_sessions
+SET status      = 'abandoned',
+    finished_at = now()
+WHERE status = 'active'
+  AND started_at < $1
+`
+
+func (q *Queries) AbandonStaleSessions(ctx context.Context, startedAt time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, abandonStaleSessions, startedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const bestPointsPerUserAndGame = `-- name: BestPointsPerUserAndGame :many
+SELECT game, user_id, max(points)::int AS best
+FROM score_events
+WHERE ($1::timestamptz IS NULL OR achieved_at >= $1)
+  AND ($2::timestamptz IS NULL OR achieved_at < $2)
+GROUP BY game, user_id
+`
+
+type BestPointsPerUserAndGameParams struct {
+	FromTime  *time.Time
+	UntilTime *time.Time
+}
+
+type BestPointsPerUserAndGameRow struct {
+	Game   string
+	UserID int64
+	Best   int32
+}
+
+func (q *Queries) BestPointsPerUserAndGame(ctx context.Context, arg BestPointsPerUserAndGameParams) ([]BestPointsPerUserAndGameRow, error) {
+	rows, err := q.db.Query(ctx, bestPointsPerUserAndGame, arg.FromTime, arg.UntilTime)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BestPointsPerUserAndGameRow{}
+	for rows.Next() {
+		var i BestPointsPerUserAndGameRow
+		if err := rows.Scan(&i.Game, &i.UserID, &i.Best); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countActiveGameSessions = `-- name: CountActiveGameSessions :one
 SELECT count(*) FROM game_sessions
 WHERE user_id = $1
@@ -42,6 +97,18 @@ WHERE user_id = $1
 
 func (q *Queries) CountActiveGameSessions(ctx context.Context, userID int64) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveGameSessions, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUnprojectedScoreEvents = `-- name: CountUnprojectedScoreEvents :one
+SELECT count(*) FROM score_events
+WHERE projected_at IS NULL
+`
+
+func (q *Queries) CountUnprojectedScoreEvents(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnprojectedScoreEvents)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -302,6 +369,17 @@ WHERE id = $1
 func (q *Queries) MarkScoreEventProjected(ctx context.Context, id int64) error {
 	_, err := q.db.Exec(ctx, markScoreEventProjected, id)
 	return err
+}
+
+const now = `-- name: Now :one
+SELECT now()::timestamptz AS now
+`
+
+func (q *Queries) Now(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRow(ctx, now)
+	var now time.Time
+	err := row.Scan(&now)
+	return now, err
 }
 
 const saveGameSessionState = `-- name: SaveGameSessionState :one

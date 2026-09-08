@@ -65,3 +65,24 @@ SELECT * FROM score_events
 WHERE projected_at IS NULL
 ORDER BY id
 LIMIT $1;
+
+-- name: BestPointsPerUserAndGame :many
+SELECT game, user_id, max(points)::int AS best
+FROM score_events
+WHERE (sqlc.narg(from_time)::timestamptz IS NULL OR achieved_at >= sqlc.narg(from_time))
+  AND (sqlc.narg(until_time)::timestamptz IS NULL OR achieved_at < sqlc.narg(until_time))
+GROUP BY game, user_id;
+
+-- name: AbandonStaleSessions :execrows
+UPDATE game_sessions
+SET status      = 'abandoned',
+    finished_at = now()
+WHERE status = 'active'
+  AND started_at < $1;
+
+-- name: CountUnprojectedScoreEvents :one
+SELECT count(*) FROM score_events
+WHERE projected_at IS NULL;
+
+-- name: Now :one
+SELECT now()::timestamptz AS now;

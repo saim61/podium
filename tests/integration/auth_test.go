@@ -105,7 +105,7 @@ func newAuthHarness(t *testing.T, opts ...harnessOption) *authHarness {
 	service, err := auth.NewService(pool, cfg.Auth)
 	require.NoError(t, err)
 
-	limiter, err := ratelimit.New(rdb)
+	limiter, err := ratelimit.New(rdb, cfg.Redis.OpTimeout)
 	require.NoError(t, err)
 
 	holds := &holdRecorder{}

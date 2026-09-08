@@ -65,12 +65,13 @@ type Projector interface {
 
 // Service is the session lifecycle.
 type Service struct {
-	pool      *pgxpool.Pool
-	queries   *db.Queries
-	registry  *games.Registry
-	projector Projector
-	now       func() time.Time
-	sleep     func(ctx context.Context, until time.Time) error
+	pool           *pgxpool.Pool
+	queries        *db.Queries
+	registry       *games.Registry
+	projector      Projector
+	projectTimeout time.Duration
+	now            func() time.Time
+	sleep          func(ctx context.Context, until time.Time) error
 }
 
 // Option adjusts a Service at construction.
@@ -86,6 +87,13 @@ func WithProjector(p Projector) Option {
 	return func(s *Service) { s.projector = p }
 }
 
+// WithProjectTimeout bounds how long the inline projection may take. A Redis outage must cost a
+// player milliseconds, not the client's whole request: the score is already committed, and the
+// projector sweeps whatever the deadline cut short.
+func WithProjectTimeout(d time.Duration) Option {
+	return func(s *Service) { s.projectTimeout = d }
+}
+
 // WithSleeper replaces the delay used to hold a response back. Tests use it to record what the
 // engine asked for instead of waiting for it.
 func WithSleeper(sleep func(ctx context.Context, until time.Time) error) Option {
@@ -95,11 +103,12 @@ func WithSleeper(sleep func(ctx context.Context, until time.Time) error) Option 
 // NewService builds the session service.
 func NewService(pool *pgxpool.Pool, registry *games.Registry, opts ...Option) *Service {
 	s := &Service{
-		pool:     pool,
-		queries:  db.New(pool),
-		registry: registry,
-		now:      time.Now,
-		sleep:    sleepUntil,
+		pool:           pool,
+		queries:        db.New(pool),
+		registry:       registry,
+		now:            time.Now,
+		sleep:          sleepUntil,
+		projectTimeout: 500 * time.Millisecond,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -356,7 +365,10 @@ func (s *Service) project(ctx context.Context, userID int64, score *Score) *lead
 		return nil
 	}
 
-	placement, err := s.projector.Submit(ctx, userID, score.Game, score.Points, score.AchievedAt)
+	projectCtx, cancel := context.WithTimeout(ctx, s.projectTimeout)
+	defer cancel()
+
+	placement, err := s.projector.Submit(projectCtx, userID, score.Game, score.Points, score.AchievedAt)
 	if err != nil {
 		observability.Logger(ctx).Error("could not project score to leaderboards",
 			slog.Int64("score_event_id", score.EventID),

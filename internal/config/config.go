@@ -32,6 +32,7 @@ type Config struct {
 	Redis    Redis
 	Log      Log
 	Auth     Auth
+	Worker   Worker
 
 	warnings []string
 }
@@ -50,6 +51,14 @@ type Auth struct {
 	LoginMaxAccount int
 	LoginWindow     time.Duration
 	TrustProxyIP    bool
+}
+
+// Worker configures the background process that keeps Redis in step with Postgres.
+type Worker struct {
+	ProjectorInterval    time.Duration
+	ProjectorBatch       int
+	HousekeepingInterval time.Duration
+	SessionMaxAge        time.Duration
 }
 
 // Argon2 holds the password hashing cost. Values are recorded in every hash, so raising them
@@ -79,9 +88,19 @@ type Postgres struct {
 }
 
 // Redis configures the client.
+//
+// The timeouts are deliberately tight. Redis holds only derived state here, so every caller is
+// written to carry on without it - but "carry on" is worthless if each call first spends the
+// default retry budget discovering Redis is gone. Failing in milliseconds is what makes
+// degrading gracefully actually graceful.
 type Redis struct {
-	URL      string
-	PoolSize int
+	URL          string
+	PoolSize     int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	MaxRetries   int
+	OpTimeout    time.Duration
 }
 
 // Log configures the structured logger.
@@ -120,8 +139,13 @@ func Load() (Config, error) {
 			MaxConnIdleTime: l.duration("POSTGRES_MAX_CONN_IDLE_TIME", 30*time.Minute),
 		},
 		Redis: Redis{
-			URL:      l.url("REDIS_URL", "redis://localhost:6379/0"),
-			PoolSize: l.intRange("REDIS_POOL_SIZE", 10, 1, 1000),
+			URL:          l.url("REDIS_URL", "redis://localhost:6379/0"),
+			PoolSize:     l.intRange("REDIS_POOL_SIZE", 10, 1, 1000),
+			DialTimeout:  l.duration("REDIS_DIAL_TIMEOUT", 2*time.Second),
+			ReadTimeout:  l.duration("REDIS_READ_TIMEOUT", time.Second),
+			WriteTimeout: l.duration("REDIS_WRITE_TIMEOUT", time.Second),
+			MaxRetries:   l.intRange("REDIS_MAX_RETRIES", 1, 0, 10),
+			OpTimeout:    l.duration("REDIS_OP_TIMEOUT", 500*time.Millisecond),
 		},
 		Log: Log{
 			Level:  l.level("LOG_LEVEL", slog.LevelInfo),
@@ -141,6 +165,12 @@ func Load() (Config, error) {
 			LoginMaxAccount: l.intRange("LOGIN_MAX_PER_ACCOUNT", 8, 1, 10000),
 			LoginWindow:     l.duration("LOGIN_WINDOW", 15*time.Minute),
 			TrustProxyIP:    l.boolean("TRUST_PROXY_IP", false),
+		},
+		Worker: Worker{
+			ProjectorInterval:    l.duration("PROJECTOR_INTERVAL", 5*time.Second),
+			ProjectorBatch:       l.intRange("PROJECTOR_BATCH", 200, 1, 10000),
+			HousekeepingInterval: l.duration("HOUSEKEEPING_INTERVAL", time.Hour),
+			SessionMaxAge:        l.duration("SESSION_MAX_AGE", 2*time.Hour),
 		},
 	}
 

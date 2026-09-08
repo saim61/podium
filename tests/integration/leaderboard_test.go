@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +32,10 @@ func newBoard(t *testing.T) *boardFixture {
 	pool := testsupport.Postgres(t)
 	rdb := testsupport.Redis(t)
 
-	fixed := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	// Pinned for the duration of a test so bucket names are stable, but taken from the real
+	// clock rather than hardcoded: a rebuild buckets by the database's clock, and a fixture
+	// date that disagreed with it would put scores in windows the rebuild does not look at.
+	fixed := time.Now().UTC()
 
 	board, err := leaderboard.New(rdb, user.NewDirectory(pool),
 		leaderboard.WithClock(func() time.Time { return fixed }))
@@ -56,9 +60,30 @@ func (f *boardFixture) player(t *testing.T, username string) int64 {
 func (f *boardFixture) submit(t *testing.T, userID int64, game games.Slug, points int) leaderboard.Placement {
 	t.Helper()
 
+	f.record(t, userID, game, points)
+
 	placement, err := f.board.Submit(t.Context(), userID, game, points, f.at)
 	require.NoError(t, err)
 	return placement
+}
+
+// record writes the authoritative score row a finished session would have written, so a rebuild
+// reading Postgres sees the same history Redis was given. achieved_at is pinned to the fixture's
+// clock rather than now(), so period windows do not depend on the machine's date.
+func (f *boardFixture) record(t *testing.T, userID int64, game games.Slug, points int) {
+	t.Helper()
+
+	var sessionID uuid.UUID
+	require.NoError(t, f.pool.QueryRow(t.Context(), `
+		INSERT INTO game_sessions (user_id, game, seed, state, status, started_at, finished_at)
+		VALUES ($1, $2, 1, '{}', 'finished', $3, $3)
+		RETURNING id`, userID, string(game), f.at).Scan(&sessionID))
+
+	_, err := f.pool.Exec(t.Context(), `
+		INSERT INTO score_events (user_id, session_id, game, raw, points, achieved_at, projected_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+		userID, sessionID, string(game), float64(points), points, f.at)
+	require.NoError(t, err)
 }
 
 func (f *boardFixture) score(t *testing.T, key string, userID int64) float64 {
@@ -396,13 +421,11 @@ func TestScoresLandInTheRightPeriodBucket(t *testing.T) {
 
 	f.submit(t, saeem, games.Memory, 4000)
 
-	// The fixed clock is 2026-09-07, a Monday in ISO week 37.
-	for _, key := range []string{
-		"lb:g:memory:all",
-		"lb:g:memory:d:2026-09-07",
-		"lb:g:memory:w:2026-W37",
-		"lb:g:memory:m:2026-09",
-	} {
+	// Bucket naming itself is pinned by the unit tests in the leaderboard package; here the
+	// point is that a submission reaches all four of a game's keys.
+	for _, period := range leaderboard.Periods {
+		key := leaderboard.Game(games.Memory).Key(period, f.at)
+
 		exists, err := f.redis.Exists(t.Context(), key).Result()
 		require.NoError(t, err)
 		require.Equal(t, int64(1), exists, key)

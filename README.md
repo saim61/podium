@@ -5,11 +5,12 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–4 of 10 complete — configuration, logging, the HTTP error
+> **Status:** in progress. Phases 0–5 of 10 complete — configuration, logging, the HTTP error
 > envelope, health probes, a container stack, persistence with migrations, authentication with
-> Argon2id and refresh token rotation, all five games as server-authoritative state machines, and
-> leaderboards on Redis sorted sets with atomic cross-game scoring.
-> **331 tests, 80% coverage.** See [Roadmap](#roadmap).
+> Argon2id and refresh token rotation, all five games as server-authoritative state machines,
+> leaderboards on Redis sorted sets with atomic cross-game scoring, and a projector that heals
+> drift plus a rebuild that restores every board from Postgres.
+> **347 tests, 78% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -412,6 +413,110 @@ If Redis is unreachable the score is **still recorded and the request still succ
 leaderboard is a projection; failing a real score to protect a derived one would be backwards. The
 row keeps `projected_at IS NULL`, and phase 5's sweeper picks it up.
 
+## Consistency: Redis is disposable
+
+Two mechanisms, for two different failures. They are not interchangeable, and knowing which is
+which is the point.
+
+| Failure | Symptom | Fix |
+|---|---|---|
+| A score was recorded but never published | `projected_at IS NULL` on that row | the **projector** sweeps it, automatically |
+| Redis lost everything | boards empty, rows already marked projected | `admin rebuild-leaderboards` |
+
+### The projector
+
+The API publishes a score inline as it records it, so this normally has nothing to do. It exists
+for when that inline publish fails, and its absence would be the quiet failure that turns a
+leaderboard into a lie: a score durably recorded and permanently invisible.
+
+```
+finish session
+  ├─ tx: INSERT score_events            ← durable, authoritative
+  └─ EVALSHA submit.lua (bounded)       ← derived, best effort
+       └─ on success: stamp projected_at
+```
+
+**Replaying a projection is safe**, which is what makes at-least-once delivery workable here: a
+game's board accepts a strictly better score only, so re-publishing an equal or worse one changes
+nothing and the cross-game total moves by a delta of zero. *The projection is idempotent because
+it is monotonic.* There is a test that strips `projected_at` and re-sweeps three times, asserting
+no board moves.
+
+Verified live, with Redis genuinely stopped:
+
+```
+finish -> status=finished points=10000 placement=None      # score kept, nothing published
+postgres: number-guess 10000 pending=t                     # waiting
+
+# redis restarted
+worker: ERROR projection sweep failed ... i/o timeout       # retried, kept going
+worker: ERROR projection sweep failed ... i/o timeout
+worker: INFO  projected pending scores count=1             # healed on its own
+```
+
+### The rebuild
+
+```bash
+admin rebuild-leaderboards      # keys=24 entries=28 periods=4
+```
+
+Reads `score_events`, recomputes every board from scratch, and writes each one into a **staging
+key that is then `RENAME`d into place**. `RENAME` is atomic, so a reader sees either the whole old
+board or the whole new one — deleting first and re-adding would leave a window where the
+leaderboard is visibly empty.
+
+Because the cross-game total is recomputed rather than incremented, a rebuild also **repairs
+drift**. There is a test that injects the exact corruption a non-atomic submission would cause and
+asserts the rebuild undoes it.
+
+The headline test flushes Redis completely and asserts the rebuild reproduces every board
+*byte for byte* — comparing a full snapshot of all 24 keys and their members, not merely that
+something got populated.
+
+**Clock detail worth stating.** `achieved_at` is stamped by Postgres, so the rebuild takes its
+notion of "now" from the database too, via `SELECT now()`. Using the process clock instead would
+mean any skew between app host and database put a score near a window boundary in one bucket when
+written and a different one when rebuilt. This was found by a test that disagreed with itself.
+
+Only the current day, week and month are rebuilt alongside all-time — an older bucket cannot be
+written back into a key named after the window it belongs to, and does not need to be, since
+Postgres still holds the history.
+
+### The worker
+
+A separate process from the API, because they scale on unrelated signals and a worker grinding
+through a backlog must not add latency to a request.
+
+```bash
+docker compose up -d worker
+```
+
+It runs the projector (every 5s) and housekeeping (hourly): expired refresh tokens deleted, stale
+sessions abandoned. There are tests asserting housekeeping leaves live data alone, since a sweeper
+that is too eager is worse than none.
+
+### Degrading gracefully has to be fast
+
+Every caller of Redis is written to carry on without it. That turned out to be worthless on its
+own: with Redis stopped, a single login took **83 seconds** while still returning `200`.
+
+go-redis multiplies its own retries — the pool retries a failed dial, the command layer retries
+the pool — so one dead-Redis call costs `dial timeout × pool attempts × command attempts`, and a
+login makes four of them. Client-level timeouts cannot bound that; a deadline the *caller* owns
+can:
+
+```go
+ctx, cancel := context.WithTimeout(ctx, l.timeout)   // 500ms, PODIUM_REDIS_OP_TIMEOUT
+```
+
+| | Redis up | Redis down |
+|---|---|---|
+| before | 163 ms | **83 471 ms** |
+| after | 163 ms | **2 130 ms** |
+
+Four bounded calls, so ~2s worst case. A circuit breaker would cut it further by not trying at all
+once Redis is known down; that is not built, and the bound above is what is actually claimed.
+
 ## Persistence
 
 Postgres is the source of truth. Redis holds only a projection of it — every entry above can be
@@ -703,8 +808,8 @@ and the headline number becomes fiction.
 | 2 | Auth — register/login/refresh, Argon2id, JWT, refresh rotation with reuse detection | done |
 | 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | done |
 | 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | done |
-| 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | next |
-| 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | |
+| 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | done |
+| 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | next |
 | 7 | Reports and rate limiting — hot and cold period reports, token buckets | |
 | 8 | Demo UI — play all five games, watch ranks reorder live | |
 | 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | |
@@ -714,11 +819,15 @@ and the headline number becomes fiction.
 ```
 cmd/api/                     the HTTP server
 cmd/migrate/                 one-shot schema migration job
+cmd/worker/                  projector and housekeeping loops
+cmd/admin/                   rebuild-leaderboards, status
 internal/auth/               Argon2id, JWTs, refresh rotation, no HTTP knowledge
 internal/games/              the five engines, pure state machines with no I/O
 internal/session/            session lifecycle, the only place a score is written
 internal/leaderboard/        sorted sets, submit.lua, ranks and paging
 internal/user/               username lookups for leaderboard hydration
+internal/scores/             authoritative score history for projector and rebuild
+internal/projector/          the sweep that heals unprojected scores
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters

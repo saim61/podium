@@ -21,6 +21,10 @@ func Open(cfg config.Redis) (*Client, error) {
 	}
 
 	opts.PoolSize = cfg.PoolSize
+	opts.DialTimeout = cfg.DialTimeout
+	opts.ReadTimeout = cfg.ReadTimeout
+	opts.WriteTimeout = cfg.WriteTimeout
+	opts.MaxRetries = cfg.MaxRetries
 
 	return goredis.NewClient(opts), nil
 }
