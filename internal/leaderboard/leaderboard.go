@@ -5,11 +5,13 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/saim61/podium/internal/games"
+	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/platform/redis"
 )
 
@@ -50,12 +52,18 @@ type Page struct {
 // MaxPageSize caps how much of a board one request can read.
 const MaxPageSize = 100
 
+// Announcer is told when a board changes, so connected clients can be updated.
+type Announcer interface {
+	Publish(ctx context.Context, scope string, period Period) error
+}
+
 // Board reads and writes leaderboards.
 type Board struct {
-	client *redis.Client
-	names  *nameResolver
-	submit *goredis.Script
-	now    func() time.Time
+	client    *redis.Client
+	names     *nameResolver
+	submit    *goredis.Script
+	announcer Announcer
+	now       func() time.Time
 }
 
 // Option adjusts a Board.
@@ -64,6 +72,11 @@ type Option func(*Board)
 // WithClock replaces the time source, which decides which period buckets a score lands in.
 func WithClock(now func() time.Time) Option {
 	return func(b *Board) { b.now = now }
+}
+
+// WithAnnouncer attaches the realtime fan-out a change is announced on.
+func WithAnnouncer(a Announcer) Option {
+	return func(b *Board) { b.announcer = a }
 }
 
 // New builds a Board. Names are hydrated through the resolver, which caches in Redis and falls
@@ -135,7 +148,37 @@ func (b *Board) Submit(ctx context.Context, userID int64, game games.Slug, point
 		placement.Game[period] = Standing{Points: int(values[1]), Rank: values[2]}
 		placement.Global[period] = Standing{Points: int(values[3]), Rank: values[4]}
 	}
+
+	b.announce(ctx, game, placement)
 	return placement, nil
+}
+
+// announce tells connected clients which boards moved.
+//
+// Only the periods that actually changed are announced. A score that fails to beat a personal
+// best moves nothing, and waking every subscriber to re-render an unchanged board would make
+// the busiest games the noisiest for no reason.
+func (b *Board) announce(ctx context.Context, game games.Slug, placement Placement) {
+	if b.announcer == nil {
+		return
+	}
+
+	for _, period := range Periods {
+		if !placement.Improved[period] {
+			continue
+		}
+
+		for _, scope := range []string{string(game), Global().Name()} {
+			if err := b.announcer.Publish(ctx, scope, period); err != nil {
+				// Best effort: the score is recorded and the boards are updated. A client that
+				// misses the nudge is corrected by its next snapshot.
+				observability.Logger(ctx).Warn("could not announce leaderboard change",
+					slog.String("scope", scope),
+					slog.String("period", string(period)),
+					slog.Any("error", err))
+			}
+		}
+	}
 }
 
 func integers(raw []any) ([]int64, error) {

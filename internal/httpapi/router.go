@@ -11,6 +11,7 @@ import (
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/ratelimit"
+	"github.com/saim61/podium/internal/realtime"
 	"github.com/saim61/podium/internal/session"
 )
 
@@ -21,6 +22,8 @@ type Deps struct {
 	Auth        *auth.Service
 	Sessions    *session.Service
 	Leaderboard *leaderboard.Board
+	Realtime    *realtime.Server
+	Tickets     *realtime.Tickets
 	Limiter     *ratelimit.Limiter
 	Now         func() time.Time
 }
@@ -57,8 +60,28 @@ func NewRouter(d Deps) http.Handler {
 	if d.Leaderboard != nil && d.Sessions != nil {
 		mountLeaderboards(r, d)
 	}
+	if d.Realtime != nil && d.Tickets != nil {
+		mountRealtime(r, d)
+	}
 
 	return r
+}
+
+func mountRealtime(r chi.Router, d Deps) {
+	h := &realtimeHandler{tickets: d.Tickets}
+
+	// The handshake authenticates with the ticket in its query string, so this route must not
+	// sit behind the bearer middleware - a browser cannot send a header with it.
+	r.Get("/v1/ws", d.Realtime.Handler)
+
+	if d.Auth == nil {
+		return
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(Authenticate(d.Auth.Tokens()))
+		r.Post("/v1/realtime/ticket", h.handleTicket)
+	})
 }
 
 func mountLeaderboards(r chi.Router, d Deps) {

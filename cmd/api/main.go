@@ -3,11 +3,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
@@ -18,6 +21,7 @@ import (
 	"github.com/saim61/podium/internal/platform/postgres"
 	"github.com/saim61/podium/internal/platform/redis"
 	"github.com/saim61/podium/internal/ratelimit"
+	"github.com/saim61/podium/internal/realtime"
 	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/user"
 )
@@ -68,12 +72,23 @@ func run() error {
 		return err
 	}
 
-	board, err := leaderboard.New(rdb, user.NewDirectory(pool))
+	registry := games.NewRegistry()
+
+	board, err := leaderboard.New(rdb, user.NewDirectory(pool),
+		leaderboard.WithAnnouncer(realtime.NewPublisher(rdb, cfg.Redis.OpTimeout)))
 	if err != nil {
 		return err
 	}
 
-	sessions := session.NewService(pool, games.NewRegistry(),
+	hub := realtime.NewHub(board, cfg.Realtime, log)
+	bridge := realtime.NewBridge(rdb, hub, registry, log)
+	tickets := realtime.NewTickets(rdb, cfg.Realtime, cfg.Redis.OpTimeout)
+
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error { return hub.Run(groupCtx) })
+	group.Go(func() error { return bridge.Run(groupCtx) })
+
+	sessions := session.NewService(pool, registry,
 		session.WithProjector(board),
 		session.WithProjectTimeout(cfg.Redis.OpTimeout))
 
@@ -83,6 +98,8 @@ func run() error {
 		Auth:        authService,
 		Sessions:    sessions,
 		Leaderboard: board,
+		Realtime:    realtime.NewServer(hub, tickets, registry, cfg.Realtime, log),
+		Tickets:     tickets,
 		Limiter:     limiter,
 		Checks: []httpapi.Check{
 			{Name: "postgres", Probe: pool.Ping},
@@ -90,5 +107,10 @@ func run() error {
 		},
 	})
 
-	return httpapi.Serve(ctx, cfg.HTTP, log, router, nil)
+	group.Go(func() error { return httpapi.Serve(groupCtx, cfg.HTTP, log, router, nil) })
+
+	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
 }

@@ -33,6 +33,7 @@ type Config struct {
 	Log      Log
 	Auth     Auth
 	Worker   Worker
+	Realtime Realtime
 
 	warnings []string
 }
@@ -51,6 +52,18 @@ type Auth struct {
 	LoginMaxAccount int
 	LoginWindow     time.Duration
 	TrustProxyIP    bool
+}
+
+// Realtime configures the WebSocket fan-out.
+type Realtime struct {
+	FlushInterval   time.Duration
+	TopN            int
+	SendBuffer      int
+	TicketTTL       time.Duration
+	MaxChannels     int
+	WriteTimeout    time.Duration
+	PingInterval    time.Duration
+	MaxConnsPerUser int
 }
 
 // Worker configures the background process that keeps Redis in step with Postgres.
@@ -165,6 +178,16 @@ func Load() (Config, error) {
 			LoginMaxAccount: l.intRange("LOGIN_MAX_PER_ACCOUNT", 8, 1, 10000),
 			LoginWindow:     l.duration("LOGIN_WINDOW", 15*time.Minute),
 			TrustProxyIP:    l.boolean("TRUST_PROXY_IP", false),
+		},
+		Realtime: Realtime{
+			FlushInterval:   l.duration("RT_FLUSH_INTERVAL", 250*time.Millisecond),
+			TopN:            l.intRange("RT_TOP_N", 10, 1, 100),
+			SendBuffer:      l.intRange("RT_SEND_BUFFER", 16, 1, 1024),
+			TicketTTL:       l.duration("RT_TICKET_TTL", 30*time.Second),
+			MaxChannels:     l.intRange("RT_MAX_CHANNELS", 16, 1, 256),
+			WriteTimeout:    l.duration("RT_WRITE_TIMEOUT", 5*time.Second),
+			PingInterval:    l.duration("RT_PING_INTERVAL", 30*time.Second),
+			MaxConnsPerUser: l.intRange("RT_MAX_CONNS_PER_USER", 4, 1, 64),
 		},
 		Worker: Worker{
 			ProjectorInterval:    l.duration("PROJECTOR_INTERVAL", 5*time.Second),

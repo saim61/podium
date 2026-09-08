@@ -22,6 +22,8 @@ linters:
         linters:
           - errcheck
           - noctx
+          # Test helpers close response bodies through t.Cleanup, which bodyclose cannot follow.
+          - bodyclose
       - linters:
           - revive
         text: "should have comment|should have a package comment"

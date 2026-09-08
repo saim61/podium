@@ -5,12 +5,13 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–5 of 10 complete — configuration, logging, the HTTP error
+> **Status:** in progress. Phases 0–6 of 10 complete — configuration, logging, the HTTP error
 > envelope, health probes, a container stack, persistence with migrations, authentication with
 > Argon2id and refresh token rotation, all five games as server-authoritative state machines,
 > leaderboards on Redis sorted sets with atomic cross-game scoring, and a projector that heals
-> drift plus a rebuild that restores every board from Postgres.
-> **347 tests, 78% coverage.** See [Roadmap](#roadmap).
+> drift plus a rebuild that restores every board from Postgres, and realtime WebSocket fan-out
+> that works across instances.
+> **380 tests, 78% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -87,8 +88,11 @@ protobuf, grpc and a wasm runtime into the module graph — 217 modules, up from
 slowed every Docker build for a tool the image never runs. The generated code is committed, so
 neither CI nor the image build needs sqlc at all.
 
-If port 5432 is already taken by a local Postgres, change the mapping in `compose.yaml` to
-`"5433:5432"` and set `PODIUM_DATABASE_URL` to match.
+If port 5432 is already taken by a local Postgres install, change the mapping in `compose.yaml`
+to `"5433:5432"` and set `PODIUM_DATABASE_URL` to match. This bites specifically when running the
+API on the host against the containerised database: the container publishes on IPv4 while a local
+Postgres may hold `::1`, so `localhost` can quietly reach the wrong server and fail authentication
+with a confusing `password authentication failed` — even though the container's own `psql` works.
 
 ---
 
@@ -412,6 +416,88 @@ finish session
 If Redis is unreachable the score is **still recorded and the request still succeeds**. The
 leaderboard is a projection; failing a real score to protect a derived one would be backwards. The
 row keeps `projected_at IS NULL`, and phase 5's sweeper picks it up.
+
+## Realtime
+
+```
+POST /v1/realtime/ticket        mint a single-use handshake credential (needs a token)
+GET  /v1/ws?ticket=...          the WebSocket
+```
+
+```jsonc
+→ {"op":"subscribe","channels":["memory:daily","global:all-time"]}
+← {"type":"subscribed","subscribed":["memory:daily"],"flush_ms":250}
+← {"type":"snapshot","channel":"memory:daily","total":3,
+   "entries":[{"rank":1,"username":"alice","points":5833}],"at":"..."}
+```
+
+### Notifications cross Pub/Sub, snapshots do not
+
+What travels between instances is **"the memory daily board changed"** — nothing more. Each
+instance then reads the current top N from Redis and sends that to its own subscribers.
+
+Publishing the rows themselves would mean every instance forwarding data most of them have no
+subscriber for. Publishing *diffs* would mean clients reconstructing state and getting it wrong
+after a dropped frame. A snapshot is authoritative by construction: a client that misses one is
+corrected by the next.
+
+### The part that only breaks with two instances
+
+An in-process hub broadcasting what its own process scored passes every single-instance test and
+then fails silently in production: a score submitted to instance A never reaches a socket held by
+instance B.
+
+Verified across two separate containers, a player on `:8080` and a watcher's socket on `:18081`:
+
+```
+socket on B, opening snapshot:  player 5000
+instance A scored 6666 points                 ← A only; B never touched
+pushed to the socket on B:      player 6666   ← arrived over Pub/Sub
+```
+
+The test suite runs the same arrangement — two full instances with real listeners and real
+sockets. To confirm that test can actually fail, instance B was rebuilt without its bridge and
+received nothing at all, which is exactly the bug the bridge exists to prevent.
+
+### Coalescing
+
+The hub flushes on a ticker (250 ms) rather than per change. A busy game can be scored many times
+a second, and marking a board dirty is idempotent — so a hundred changes inside one window cost
+**one Redis read and one frame**, not a hundred of each. There is a test asserting exactly that,
+and another asserting a board nobody is watching is never read at all.
+
+A score that beats nothing announces nothing. Waking every subscriber to re-render an unchanged
+board would make the busiest games the noisiest for no reason.
+
+### One slow client must not freeze the rest
+
+Each connection has a bounded send buffer and the hub delivers with a **non-blocking send**. If it
+blocked on a slow socket it would stall the flush goroutine and with it every subscriber on every
+channel — one bad client freezing the fan-out for everybody. A connection that cannot keep up is
+dropped instead.
+
+There is a test with a deliberately non-draining subscriber that fails if `Flush` blocks, and
+asserts a healthy subscriber alongside it keeps receiving.
+
+Writes all funnel through one goroutine per connection, because concurrent writes to a WebSocket
+are not allowed. Reads run in their own, so a stalled write cannot block a read. Unanswered pings
+close connections whose client vanished without saying goodbye.
+
+### Why a ticket
+
+A browser cannot set an `Authorization` header on a WebSocket handshake, and a JWT in the query
+string is written into every access log and proxy trace on the way. So `POST /v1/realtime/ticket`
+returns a 30-second, single-use credential that the handshake spends.
+
+Redemption is `GETDEL`, which makes it atomic: two handshakes racing on one captured ticket cannot
+both succeed. Read-then-delete in two commands would let both through.
+
+A ticket is required even though snapshots carry only public board data, because a socket is a
+scarce resource in a way an HTTP read is not — it holds memory and two goroutines for as long as
+it lives, so each one is tied to an account that limits can apply to.
+
+Channel names are validated against the game registry, so a client cannot name
+`lb:g:memory:all` and make the hub poll arbitrary Redis keys.
 
 ## Consistency: Redis is disposable
 
@@ -809,8 +895,8 @@ and the headline number becomes fiction.
 | 3 | Games and sessions — five engines, server-side deadlines, seeded and replayable | done |
 | 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | done |
 | 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | done |
-| 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | next |
-| 7 | Reports and rate limiting — hot and cold period reports, token buckets | |
+| 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | done |
+| 7 | Reports and rate limiting — hot and cold period reports, token buckets | next |
 | 8 | Demo UI — play all five games, watch ranks reorder live | |
 | 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | |
 
@@ -828,6 +914,7 @@ internal/leaderboard/        sorted sets, submit.lua, ranks and paging
 internal/user/               username lookups for leaderboard hydration
 internal/scores/             authoritative score history for projector and rebuild
 internal/projector/          the sweep that heals unprojected scores
+internal/realtime/           hub, Pub/Sub bridge, tickets, WebSocket endpoint
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters
