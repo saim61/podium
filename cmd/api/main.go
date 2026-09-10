@@ -25,6 +25,7 @@ import (
 	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/user"
+	"github.com/saim61/podium/internal/web"
 )
 
 func main() {
@@ -93,6 +94,11 @@ func run() error {
 		session.WithProjector(board),
 		session.WithProjectTimeout(cfg.Redis.OpTimeout))
 
+	demo, err := web.Handler()
+	if err != nil {
+		return err
+	}
+
 	router := httpapi.NewRouter(httpapi.Deps{
 		Config:      cfg,
 		Logger:      log,
@@ -102,6 +108,7 @@ func run() error {
 		Realtime:    realtime.NewServer(hub, tickets, registry, cfg.Realtime, log),
 		Tickets:     tickets,
 		Reports:     reports.NewService(pool, board, registry),
+		Web:         demo,
 		Limiter:     limiter,
 		Checks: []httpapi.Check{
 			{Name: "postgres", Probe: pool.Ping},

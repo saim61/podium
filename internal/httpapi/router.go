@@ -26,6 +26,7 @@ type Deps struct {
 	Realtime    *realtime.Server
 	Tickets     *realtime.Tickets
 	Reports     *reports.Service
+	Web         http.Handler
 	Limiter     *ratelimit.Limiter
 	Now         func() time.Time
 }
@@ -68,8 +69,22 @@ func NewRouter(d Deps) http.Handler {
 	if d.Reports != nil {
 		mountReports(r, d)
 	}
+	if d.Web != nil {
+		mountWeb(r, d)
+	}
 
 	return r
+}
+
+// mountWeb serves the demo page.
+//
+// Each asset is registered explicitly rather than behind a catch-all. A catch-all at the root
+// would also swallow an unknown /v1 path and answer it with HTML, so a client mistyping an
+// endpoint would get a web page instead of the JSON error the API promises.
+func mountWeb(r chi.Router, d Deps) {
+	for _, path := range []string{"/", "/index.html", "/app.js", "/style.css"} {
+		r.Handle(path, d.Web)
+	}
 }
 
 func mountReports(r chi.Router, d Deps) {

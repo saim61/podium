@@ -26,6 +26,7 @@ import (
 	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/testsupport"
 	"github.com/saim61/podium/internal/user"
+	"github.com/saim61/podium/internal/web"
 )
 
 type authHarness struct {
@@ -117,6 +118,9 @@ func newAuthHarness(t *testing.T, opts ...harnessOption) *authHarness {
 	board, err := leaderboard.New(rdb, user.NewDirectory(pool))
 	require.NoError(t, err)
 
+	demo, err := web.Handler()
+	require.NoError(t, err)
+
 	sessions := session.NewService(pool, games.NewRegistry(),
 		session.WithSleeper(holds.sleep),
 		session.WithProjector(board))
@@ -129,6 +133,7 @@ func newAuthHarness(t *testing.T, opts ...harnessOption) *authHarness {
 			Sessions:    sessions,
 			Leaderboard: board,
 			Reports:     reports.NewService(pool, board, games.NewRegistry()),
+			Web:         demo,
 			Limiter:     limiter,
 		}),
 		service:  service,

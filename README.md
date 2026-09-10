@@ -5,14 +5,14 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–7 of 10 complete — configuration, logging, the HTTP error
+> **Status:** in progress. Phases 0–8 of 10 complete — configuration, logging, the HTTP error
 > envelope, health probes, a container stack, persistence with migrations, authentication with
 > Argon2id and refresh token rotation, all five games as server-authoritative state machines,
 > leaderboards on Redis sorted sets with atomic cross-game scoring, a projector that heals drift
 > alongside a rebuild that restores every board from Postgres, realtime WebSocket fan-out that
 > works across instances, and period reports with a hot/cold store split behind rate limits on
-> every route class.
-> **406 tests, 78% coverage.** See [Roadmap](#roadmap).
+> every route class, and a playable demo page embedded in the binary.
+> **416 tests, 78% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -417,6 +417,48 @@ finish session
 If Redis is unreachable the score is **still recorded and the request still succeeds**. The
 leaderboard is a projection; failing a real score to protect a derived one would be backwards. The
 row keeps `projected_at IS NULL`, and phase 5's sweeper picks it up.
+
+## The demo page
+
+```bash
+docker compose up -d --build
+open http://localhost:8080
+```
+
+Register, pick a game, play it, and watch the board on the right reorder as scores land — yours
+and anybody else's. Everything above is only describable until you can see it happen.
+
+Vanilla HTML, CSS and JavaScript: no framework, no bundler, no `node_modules`, no build step.
+Three files served from inside the binary via `embed.FS`, so the page can never be a different
+version than the API it talks to. There is a test asserting the script has no `import` or
+`require`, because a build step is exactly the thing that rots first in a demo.
+
+**Tokens live in memory only** — not `localStorage`, not `sessionStorage`. A reload therefore
+signs you out, which is the price of not leaving a bearer token where any injected script could
+read it. A real client would use an httpOnly cookie; a demo can afford to just log in again.
+
+The page is registered on **explicit paths** (`/`, `/app.js`, `/style.css`) rather than a
+catch-all at the root. A catch-all would also answer an unknown `/v1` path, so a client that
+mistyped an endpoint would get HTML instead of the JSON error envelope the API promises
+everywhere else. There is a test for that too.
+
+### What each game looks like
+
+The page renders whatever `state` the server sent, which is the engine's View — so the UI has no
+game logic in it and cannot disagree with the server about what is going on.
+
+| Game | The page's job |
+|---|---|
+| `reaction` | `arm`, then hold "wait for it…" until the response arrives — that arrival *is* the signal — then one tap |
+| `math-sprint` | show the question, take an answer, count the deadline down |
+| `memory` | flash the revealed sequence back, then let you click it in |
+| `word-scramble` | show the scramble, take a word or a skip, count down |
+| `number-guess` | show the narrowed range and the last hint |
+
+Two bugs found while reviewing this, both the same shape: a countdown left running after its game
+ended. One fired `finish()` on an already-finished session; the other survived a switch to a
+different game and would have finished *that* one early. Both are fixed by stopping the ticker in
+the one place a view is ever replaced.
 
 ## Period reports
 
@@ -985,8 +1027,8 @@ and the headline number becomes fiction.
 | 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | done |
 | 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | done |
 | 7 | Reports and rate limiting — hot and cold period reports, token buckets | done |
-| 8 | Demo UI — play all five games, watch ranks reorder live | next |
-| 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | |
+| 8 | Demo UI — play all five games, watch ranks reorder live | done |
+| 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | next |
 
 ## Layout
 
@@ -1004,6 +1046,7 @@ internal/scores/             authoritative score history for projector and rebui
 internal/projector/          the sweep that heals unprojected scores
 internal/realtime/           hub, Pub/Sub bridge, tickets, WebSocket endpoint
 internal/reports/            period reports across Redis, snapshots and history
+internal/web/                the demo page, embedded in the binary
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters

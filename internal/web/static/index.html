@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Podium</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Podium</h1>
+  <div id="who" class="who"></div>
+</header>
+
+<main>
+  <section id="auth" class="panel">
+    <h2>Sign in</h2>
+    <p class="hint">No account? Registering signs you straight in.</p>
+
+    <form id="login-form" autocomplete="on">
+      <label>Username or email <input id="login-id" required autocomplete="username"></label>
+      <label>Password <input id="login-pass" type="password" required autocomplete="current-password"></label>
+      <button type="submit">Sign in</button>
+    </form>
+
+    <details>
+      <summary>Create an account</summary>
+      <form id="register-form" autocomplete="on">
+        <label>Username <input id="reg-user" required minlength="3" maxlength="32" autocomplete="username"></label>
+        <label>Email <input id="reg-email" type="email" required autocomplete="email"></label>
+        <label>Password <input id="reg-pass" type="password" required minlength="12" autocomplete="new-password"></label>
+        <button type="submit">Register</button>
+      </form>
+    </details>
+
+    <p id="auth-error" class="error" hidden></p>
+  </section>
+
+  <section id="play" class="panel" hidden>
+    <div class="play-head">
+      <h2 id="game-name">Pick a game</h2>
+      <button id="quit" class="ghost" hidden>Give up</button>
+    </div>
+
+    <div id="game-picker" class="picker"></div>
+    <ul id="game-rules" class="rules" hidden></ul>
+
+    <div id="stage" class="stage" hidden></div>
+    <div id="result" class="result" hidden></div>
+    <p id="play-error" class="error" hidden></p>
+  </section>
+
+  <aside class="panel">
+    <div class="board-head">
+      <h2>Leaderboard</h2>
+      <span id="ws-state" class="badge offline">offline</span>
+    </div>
+
+    <div class="board-controls">
+      <select id="board-scope"></select>
+      <select id="board-period">
+        <option value="all-time">all time</option>
+        <option value="daily">today</option>
+        <option value="weekly">this week</option>
+        <option value="monthly">this month</option>
+      </select>
+    </div>
+
+    <table class="board">
+      <thead><tr><th>#</th><th>player</th><th>points</th></tr></thead>
+      <tbody id="board-rows"><tr class="empty"><td colspan="3">Nobody has played yet.</td></tr></tbody>
+    </table>
+
+    <p class="hint" id="board-note">Updates arrive over a WebSocket as scores land.</p>
+  </aside>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
