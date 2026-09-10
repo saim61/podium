@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/saim61/podium/internal/config"
+	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/platform/postgres"
 	"github.com/saim61/podium/internal/platform/redis"
+	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/scores"
 	"github.com/saim61/podium/internal/user"
 )
@@ -22,6 +25,7 @@ const usage = `podium admin
 Usage:
   admin rebuild-leaderboards   Rebuild every leaderboard in Redis from Postgres
   admin status                 Report projection backlog and board sizes
+  admin materialise-reports    Freeze the leading players of every closed window
 `
 
 func main() {
@@ -72,6 +76,8 @@ func run(command string) error {
 		return rebuild(ctx, board, store, log)
 	case "status":
 		return status(ctx, board, store, log)
+	case "materialise-reports":
+		return materialise(ctx, reports.NewService(pool, board, games.NewRegistry()), log)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return fmt.Errorf("unknown command %q", command)
@@ -90,6 +96,20 @@ func rebuild(ctx context.Context, board *leaderboard.Board, store *scores.Store,
 		slog.Int("keys", report.Keys),
 		slog.Int("entries", report.Entries),
 		slog.Int("periods", len(report.Periods)))
+	return nil
+}
+
+func materialise(ctx context.Context, service *reports.Service, log *slog.Logger) error {
+	log.Info("materialising closed leaderboard windows")
+
+	report, err := service.MaterialiseClosedWindows(ctx, time.Now())
+	if err != nil {
+		return err
+	}
+
+	log.Info("materialisation complete",
+		slog.Int("written", report.Written),
+		slog.Int("skipped", report.Skipped))
 	return nil
 }
 

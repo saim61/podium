@@ -417,7 +417,7 @@ func TestHousekeeperRemovesExpiredRefreshTokens(t *testing.T) {
 	require.NoError(t, err)
 
 	store := scores.NewStore(h.pool)
-	require.NoError(t, projector.NewHousekeeper(store, workerConfig(), discard()).Sweep(t.Context()))
+	require.NoError(t, projector.NewHousekeeper(store, workerConfig(), discard(), nil).Sweep(t.Context()))
 
 	var remaining int
 	require.NoError(t, h.pool.QueryRow(t.Context(),
@@ -436,7 +436,7 @@ func TestHousekeeperAbandonsStaleSessions(t *testing.T) {
 	require.NoError(t, err)
 
 	store := scores.NewStore(h.pool)
-	require.NoError(t, projector.NewHousekeeper(store, workerConfig(), discard()).Sweep(t.Context()))
+	require.NoError(t, projector.NewHousekeeper(store, workerConfig(), discard(), nil).Sweep(t.Context()))
 
 	require.Equal(t, session.StatusAbandoned, h.sessionStatus(t, opened.ID))
 }
@@ -447,7 +447,7 @@ func TestHousekeeperLeavesLiveDataAlone(t *testing.T) {
 	opened := h.startSession(t, player.Tokens.AccessToken, games.Memory)
 
 	store := scores.NewStore(h.pool)
-	require.NoError(t, projector.NewHousekeeper(store, workerConfig(), discard()).Sweep(t.Context()))
+	require.NoError(t, projector.NewHousekeeper(store, workerConfig(), discard(), nil).Sweep(t.Context()))
 
 	require.Equal(t, session.StatusActive, h.sessionStatus(t, opened.ID))
 

@@ -13,11 +13,13 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/saim61/podium/internal/config"
+	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/platform/postgres"
 	"github.com/saim61/podium/internal/platform/redis"
 	"github.com/saim61/podium/internal/projector"
+	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/scores"
 	"github.com/saim61/podium/internal/user"
 )
@@ -64,13 +66,14 @@ func run() error {
 	}
 
 	store := scores.NewStore(pool)
+	reporter := reports.NewService(pool, board, games.NewRegistry())
 
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		return projector.New(store, board, cfg.Worker, log).Run(groupCtx)
 	})
 	group.Go(func() error {
-		return projector.NewHousekeeper(store, cfg.Worker, log).Run(groupCtx)
+		return projector.NewHousekeeper(store, cfg.Worker, log, reporter).Run(groupCtx)
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {

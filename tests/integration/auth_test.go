@@ -22,6 +22,7 @@ import (
 	"github.com/saim61/podium/internal/httpapi"
 	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/ratelimit"
+	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/testsupport"
 	"github.com/saim61/podium/internal/user"
@@ -127,6 +128,7 @@ func newAuthHarness(t *testing.T, opts ...harnessOption) *authHarness {
 			Auth:        service,
 			Sessions:    sessions,
 			Leaderboard: board,
+			Reports:     reports.NewService(pool, board, games.NewRegistry()),
 			Limiter:     limiter,
 		}),
 		service:  service,

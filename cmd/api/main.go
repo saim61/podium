@@ -22,6 +22,7 @@ import (
 	"github.com/saim61/podium/internal/platform/redis"
 	"github.com/saim61/podium/internal/ratelimit"
 	"github.com/saim61/podium/internal/realtime"
+	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/session"
 	"github.com/saim61/podium/internal/user"
 )
@@ -100,6 +101,7 @@ func run() error {
 		Leaderboard: board,
 		Realtime:    realtime.NewServer(hub, tickets, registry, cfg.Realtime, log),
 		Tickets:     tickets,
+		Reports:     reports.NewService(pool, board, registry),
 		Limiter:     limiter,
 		Checks: []httpapi.Check{
 			{Name: "postgres", Probe: pool.Ping},

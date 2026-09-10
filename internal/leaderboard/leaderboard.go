@@ -203,8 +203,26 @@ func (b *Board) Size(ctx context.Context, scope Scope, period Period) (int64, er
 	return total, nil
 }
 
-// Page reads a slice of a board, highest scores first.
+// Exists reports whether a board's key is still in Redis.
+//
+// A past window is readable from Redis for as long as its key lives, and an empty board is a
+// legitimate answer - so "no players" and "the window has aged out" have to be told apart by
+// asking whether the key is there at all.
+func (b *Board) Exists(ctx context.Context, scope Scope, period Period, at time.Time) (bool, error) {
+	found, err := b.client.Exists(ctx, scope.Key(period, at)).Result()
+	if err != nil {
+		return false, fmt.Errorf("check leaderboard key: %w", err)
+	}
+	return found == 1, nil
+}
+
+// Page reads a slice of the current window of a board, highest scores first.
 func (b *Board) Page(ctx context.Context, scope Scope, period Period, offset, limit int) (Page, error) {
+	return b.PageAt(ctx, scope, period, b.now(), offset, limit)
+}
+
+// PageAt reads a slice of the window containing at, which is how a report reads yesterday.
+func (b *Board) PageAt(ctx context.Context, scope Scope, period Period, at time.Time, offset, limit int) (Page, error) {
 	if limit <= 0 || limit > MaxPageSize {
 		limit = 20
 	}
@@ -212,11 +230,11 @@ func (b *Board) Page(ctx context.Context, scope Scope, period Period, offset, li
 		offset = 0
 	}
 
-	key := scope.Key(period, b.now())
+	key := scope.Key(period, at)
 
-	total, err := b.Size(ctx, scope, period)
+	total, err := b.client.ZCard(ctx, key).Result()
 	if err != nil {
-		return Page{}, err
+		return Page{}, fmt.Errorf("count leaderboard: %w", err)
 	}
 
 	rows, err := b.client.ZRevRangeWithScores(ctx, key, int64(offset), int64(offset+limit-1)).Result()

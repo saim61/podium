@@ -11,6 +11,7 @@ import (
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/leaderboard"
+	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/scores"
 )
 
@@ -98,16 +99,22 @@ func (p *Projector) Sweep(ctx context.Context) (int, error) {
 	return projected, nil
 }
 
-// Housekeeper removes data nothing can use any more.
-type Housekeeper struct {
-	store *scores.Store
-	cfg   config.Worker
-	log   *slog.Logger
+// Materialiser freezes the leading players of a window that has closed.
+type Materialiser interface {
+	MaterialiseClosedWindows(ctx context.Context, at time.Time) (reports.MaterialiseReport, error)
 }
 
-// NewHousekeeper builds the housekeeping loop.
-func NewHousekeeper(store *scores.Store, cfg config.Worker, log *slog.Logger) *Housekeeper {
-	return &Housekeeper{store: store, cfg: cfg, log: log}
+// Housekeeper removes data nothing can use any more and freezes windows that have closed.
+type Housekeeper struct {
+	store       *scores.Store
+	cfg         config.Worker
+	log         *slog.Logger
+	materialise Materialiser
+}
+
+// NewHousekeeper builds the housekeeping loop. materialise may be nil.
+func NewHousekeeper(store *scores.Store, cfg config.Worker, log *slog.Logger, materialise Materialiser) *Housekeeper {
+	return &Housekeeper{store: store, cfg: cfg, log: log, materialise: materialise}
 }
 
 // Run sweeps on a ticker until the context is cancelled.
@@ -147,6 +154,22 @@ func (h *Housekeeper) Sweep(ctx context.Context) error {
 	}
 	if abandoned > 0 {
 		h.log.Info("abandoned stale sessions", slog.Int64("count", abandoned))
+	}
+
+	if h.materialise == nil {
+		return nil
+	}
+
+	// Freezing a closed window turns an aggregation over the whole score history into a single
+	// indexed row, which is what keeps an old report cheap once Redis has let the window go.
+	frozen, err := h.materialise.MaterialiseClosedWindows(ctx, time.Now())
+	if err != nil {
+		return err
+	}
+	if frozen.Written > 0 {
+		h.log.Info("materialised closed leaderboard windows",
+			slog.Int("written", frozen.Written),
+			slog.Int("skipped", frozen.Skipped))
 	}
 	return nil
 }

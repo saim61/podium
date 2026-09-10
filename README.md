@@ -5,13 +5,14 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–6 of 10 complete — configuration, logging, the HTTP error
+> **Status:** in progress. Phases 0–7 of 10 complete — configuration, logging, the HTTP error
 > envelope, health probes, a container stack, persistence with migrations, authentication with
 > Argon2id and refresh token rotation, all five games as server-authoritative state machines,
-> leaderboards on Redis sorted sets with atomic cross-game scoring, and a projector that heals
-> drift plus a rebuild that restores every board from Postgres, and realtime WebSocket fan-out
-> that works across instances.
-> **380 tests, 78% coverage.** See [Roadmap](#roadmap).
+> leaderboards on Redis sorted sets with atomic cross-game scoring, a projector that heals drift
+> alongside a rebuild that restores every board from Postgres, realtime WebSocket fan-out that
+> works across instances, and period reports with a hot/cold store split behind rate limits on
+> every route class.
+> **406 tests, 78% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -416,6 +417,93 @@ finish session
 If Redis is unreachable the score is **still recorded and the request still succeeds**. The
 leaderboard is a projection; failing a real score to protect a derived one would be backwards. The
 row keeps `projected_at IS NULL`, and phase 5's sweeper picks it up.
+
+## Period reports
+
+```
+GET /v1/reports/top-players?period=daily&date=2026-09-09&game=memory&limit=10
+```
+
+The window is chosen by a **date**, not an offset like "yesterday", so a report is a stable thing
+that can be linked to and cached. `date=2026-09-09` with `period=weekly` means the week containing
+that day; omit it for the current window, omit `game` for the cross-game board.
+
+### Three stores, tried in order of cost
+
+| `source` | Store | When |
+|---|---|---|
+| `live` | Redis sorted set | the window's key is still there |
+| `snapshot` | one `jsonb` row | the window closed and was frozen |
+| `history` | aggregate over `score_events` | anything older |
+
+The response says which one answered, so the split is **observable rather than a claim in a
+document**. Verified live on the same data:
+
+```
+source=live      alice 5833 · bob 4166 · carol 2500     ← Redis
+source=history   alice 5833 · bob 4166 · carol 2500     ← after FLUSHALL
+source=snapshot  alice 5833 · bob 4166 · carol 2500     ← after freezing the window
+```
+
+**All three must agree**, and there are tests asserting it for every period and both scopes. If
+they disagreed, the same day would have two different answers depending only on when you asked.
+That is why the cold-path SQL deliberately mirrors `submit.lua`: a game board takes each player's
+best, and the cross-game board sums those bests.
+
+```sql
+SELECT user_id, sum(best)::int AS points FROM (
+    SELECT user_id, game, max(points) AS best
+    FROM score_events WHERE achieved_at >= $1 AND achieved_at < $2
+    GROUP BY user_id, game
+) per_game GROUP BY user_id ORDER BY points DESC
+```
+
+Competition ranks are computed the same way on both paths too, so a caller cannot tell which
+store served a report from the shape of the answer — only from the `source` field.
+
+### Freezing a closed window
+
+```bash
+admin materialise-reports      # written=2 skipped=16
+```
+
+The worker does this hourly. It turns an aggregation over the entire score history into a single
+indexed row, which is what keeps an old report cheap once Redis has let the window go. Empty
+windows are skipped — an empty window is not worth a row.
+
+It is idempotent, and deliberately re-writes rather than skipping what exists: a score that
+arrived late, after the first pass, would otherwise leave a frozen window permanently wrong. A
+test asserts a late score is picked up on the next pass.
+
+**Snapshots store user ids, not usernames.** Storing names would freeze them, so after a rename a
+historical report would show a name nobody has any more while the live and history paths both
+resolve the current one. This was found by a test that compared the three sources and caught the
+snapshot path returning ids of zero.
+
+## Rate limiting
+
+Every route class has a ceiling, keyed by **account when authenticated and by address
+otherwise**. Keying reads by address alone would let one logged-in user behind a shared NAT
+exhaust the budget for everyone on it; keying by account alone leaves anonymous traffic unmetered.
+
+| Class | Default | Keyed by |
+|---|---|---|
+| login | 8 per account, 20 per IP / 15 min | both |
+| public reads | 300 / min | user or IP |
+| session moves | 600 / min | user or IP |
+| session starts | 60 / window | user |
+
+Moves get a far higher ceiling on purpose: `math-sprint` is a race against thirty seconds and a
+fast player legitimately sends dozens.
+
+```
+Ratelimit-Limit: 300
+Ratelimit-Remaining: 296
+Retry-After: 900          (on a 429)
+```
+
+A test asserts two accounts are metered separately, because a shared budget would let one busy
+player lock everyone else out.
 
 ## Realtime
 
@@ -896,8 +984,8 @@ and the headline number becomes fiction.
 | 4 | Leaderboards — sorted sets, atomic submission in Lua, top-N, rank, neighbours | done |
 | 5 | Consistency — projection cursor, self-healing drift, rebuild from Postgres | done |
 | 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | done |
-| 7 | Reports and rate limiting — hot and cold period reports, token buckets | next |
-| 8 | Demo UI — play all five games, watch ranks reorder live | |
+| 7 | Reports and rate limiting — hot and cold period reports, token buckets | done |
+| 8 | Demo UI — play all five games, watch ranks reorder live | next |
 | 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | |
 
 ## Layout
@@ -915,6 +1003,7 @@ internal/user/               username lookups for leaderboard hydration
 internal/scores/             authoritative score history for projector and rebuild
 internal/projector/          the sweep that heals unprojected scores
 internal/realtime/           hub, Pub/Sub bridge, tickets, WebSocket endpoint
+internal/reports/            period reports across Redis, snapshots and history
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters

@@ -52,6 +52,9 @@ type Auth struct {
 	LoginMaxAccount int
 	LoginWindow     time.Duration
 	TrustProxyIP    bool
+	ReadsPerWindow  int
+	MovesPerWindow  int
+	RateWindow      time.Duration
 }
 
 // Realtime configures the WebSocket fan-out.
@@ -178,6 +181,9 @@ func Load() (Config, error) {
 			LoginMaxAccount: l.intRange("LOGIN_MAX_PER_ACCOUNT", 8, 1, 10000),
 			LoginWindow:     l.duration("LOGIN_WINDOW", 15*time.Minute),
 			TrustProxyIP:    l.boolean("TRUST_PROXY_IP", false),
+			ReadsPerWindow:  l.intRange("READS_PER_WINDOW", 300, 1, 1_000_000),
+			MovesPerWindow:  l.intRange("MOVES_PER_WINDOW", 600, 1, 1_000_000),
+			RateWindow:      l.duration("RATE_WINDOW", time.Minute),
 		},
 		Realtime: Realtime{
 			FlushInterval:   l.duration("RT_FLUSH_INTERVAL", 250*time.Millisecond),

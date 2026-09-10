@@ -12,6 +12,7 @@ import (
 	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/ratelimit"
 	"github.com/saim61/podium/internal/realtime"
+	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/session"
 )
 
@@ -24,6 +25,7 @@ type Deps struct {
 	Leaderboard *leaderboard.Board
 	Realtime    *realtime.Server
 	Tickets     *realtime.Tickets
+	Reports     *reports.Service
 	Limiter     *ratelimit.Limiter
 	Now         func() time.Time
 }
@@ -63,8 +65,22 @@ func NewRouter(d Deps) http.Handler {
 	if d.Realtime != nil && d.Tickets != nil {
 		mountRealtime(r, d)
 	}
+	if d.Reports != nil {
+		mountReports(r, d)
+	}
 
 	return r
+}
+
+func mountReports(r chi.Router, d Deps) {
+	h := &reportsHandler{service: d.Reports}
+
+	r.Group(func(r chi.Router) {
+		r.Use(RateLimit(d.Limiter, d.Config.Auth, "reads",
+			d.Config.Auth.ReadsPerWindow, d.Config.Auth.RateWindow))
+
+		r.Get("/v1/reports/top-players", h.handleTopPlayers)
+	})
 }
 
 func mountRealtime(r chi.Router, d Deps) {
@@ -88,9 +104,15 @@ func mountLeaderboards(r chi.Router, d Deps) {
 	h := &leaderboardHandler{board: d.Leaderboard, sessions: d.Sessions}
 
 	// Reading a leaderboard needs no account. It is the public face of the product, and
-	// requiring a login to see who is winning would be an odd choice.
-	r.Get("/v1/leaderboards/global", h.handleGlobalPage)
-	r.Get("/v1/leaderboards/{game}", h.handleGamePage)
+	// requiring a login to see who is winning would be an odd choice - but an unauthenticated
+	// read still needs a ceiling.
+	r.Group(func(r chi.Router) {
+		r.Use(RateLimit(d.Limiter, d.Config.Auth, "reads",
+			d.Config.Auth.ReadsPerWindow, d.Config.Auth.RateWindow))
+
+		r.Get("/v1/leaderboards/global", h.handleGlobalPage)
+		r.Get("/v1/leaderboards/{game}", h.handleGamePage)
+	})
 
 	if d.Auth == nil {
 		return
@@ -125,8 +147,16 @@ func mountGames(r chi.Router, d Deps) {
 
 		r.Post("/v1/games/{slug}/sessions", h.handleStartSession)
 		r.Get("/v1/sessions/{id}", h.handleGetSession)
-		r.Post("/v1/sessions/{id}/moves", h.handleMove)
 		r.Post("/v1/sessions/{id}/finish", h.handleFinish)
+
+		// Moves get their own, far higher ceiling: math-sprint is a race against 30 seconds
+		// and a fast player legitimately sends dozens.
+		r.Group(func(r chi.Router) {
+			r.Use(RateLimit(d.Limiter, d.Config.Auth, "moves",
+				d.Config.Auth.MovesPerWindow, d.Config.Auth.RateWindow))
+
+			r.Post("/v1/sessions/{id}/moves", h.handleMove)
+		})
 	})
 }
 

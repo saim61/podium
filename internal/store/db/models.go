@@ -23,6 +23,17 @@ type GameSession struct {
 	FinishedAt *time.Time
 }
 
+type LeaderboardSnapshot struct {
+	ID          int64
+	Scope       string
+	Period      string
+	WindowFrom  time.Time
+	WindowUntil time.Time
+	PlayerCount int32
+	Entries     []byte
+	CreatedAt   time.Time
+}
+
 type RefreshToken struct {
 	ID        int64
 	UserID    int64
