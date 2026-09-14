@@ -13,7 +13,7 @@ Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap
 > works across instances, and period reports with a hot/cold store split behind rate limits on
 > every route class, a playable demo page embedded in the binary, and Prometheus metrics, an
 > OpenAPI description and load numbers.
-> **423 tests, 77% coverage.** See [Roadmap](#roadmap).
+> **429 tests, 77% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -78,6 +78,32 @@ CI additionally runs the suite under `-race`, which is where the concurrent part
 the leaderboard projection and the realtime hub — are actually held to account. It is not in the
 list above because `-race` requires cgo and therefore a C toolchain, which a stock Windows Go
 install does not have. Don't take a locally green suite as evidence of race-freedom.
+
+**And not as evidence for Linux either.** This suite once passed on Windows and failed every
+single integration test in CI, with a message that blamed pgxpool hooks the code does not use:
+
+```
+pgxpool: too many failed attempts acquiring connection;
+likely bug in PrepareConn, BeforeAcquire, or ShouldPing hook
+```
+
+The cause was a `MaxConnLifetime` left at zero. pgxpool computes a connection's expiry as
+`createdAt.Add(MaxConnLifetime)`, so zero means every connection is born already expired —
+`Acquire` takes one, finds it expired, destroys it, and loops until it gives up. Whether that
+bites depends entirely on clock resolution:
+
+```
+windows/amd64: of 100000 connections, 100000 would survive (clock had not advanced)
+linux/amd64:   of 100000 connections,      0 would survive
+```
+
+`postgres.Open` now replaces any non-positive limit with a working default, so no caller can
+build a pool that destroys its own connections. To reproduce a CI failure locally without a
+Linux machine:
+
+```bash
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/src"   -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal -w /src golang:1.26   go test -race ./...
+```
 
 After changing a query or a migration, regenerate the typed query layer:
 
