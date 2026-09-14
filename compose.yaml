@@ -62,6 +62,8 @@ services:
   worker:
     <<: *app
     command: ["worker"]
+    ports:
+      - "9100:9100"
     healthcheck:
       disable: true
     depends_on:

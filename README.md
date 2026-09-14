@@ -5,14 +5,15 @@ leaderboards built on Redis sorted sets, with ranks that update in the browser a
 
 Built in Go against the [roadmap.sh real-time leaderboard brief](https://roadmap.sh/projects/realtime-leaderboard-system).
 
-> **Status:** in progress. Phases 0–8 of 10 complete — configuration, logging, the HTTP error
+> **Status:** Phases 0–9 of 10 complete — configuration, logging, the HTTP error
 > envelope, health probes, a container stack, persistence with migrations, authentication with
 > Argon2id and refresh token rotation, all five games as server-authoritative state machines,
 > leaderboards on Redis sorted sets with atomic cross-game scoring, a projector that heals drift
 > alongside a rebuild that restores every board from Postgres, realtime WebSocket fan-out that
 > works across instances, and period reports with a hot/cold store split behind rate limits on
-> every route class, and a playable demo page embedded in the binary.
-> **416 tests, 78% coverage.** See [Roadmap](#roadmap).
+> every route class, a playable demo page embedded in the binary, and Prometheus metrics, an
+> OpenAPI description and load numbers.
+> **423 tests, 77% coverage.** See [Roadmap](#roadmap).
 
 ---
 
@@ -417,6 +418,101 @@ finish session
 If Redis is unreachable the score is **still recorded and the request still succeeds**. The
 leaderboard is a projection; failing a real score to protect a derived one would be backwards. The
 row keeps `projected_at IS NULL`, and phase 5's sweeper picks it up.
+
+## How it fits together
+
+```
+                    browser
+                       |
+          HTTP + WebSocket (one origin)
+                       |
+        +--------------+--------------+
+        |            API x N          |          worker x1
+        |  chi router, games, auth    |   projector  housekeeper
+        |  hub  <-  bridge            |        |         |
+        +------+---------------+------+--------+---------+
+               |               |               |
+               |          Pub/Sub rt:leaderboard
+               |               |               |
+         +-----v-----+   +-----v---------------v-----+
+         | Postgres  |   |           Redis           |
+         |           |   |                           |
+         | users     |   | 24 sorted sets            |
+         | sessions  |-->| rate limit counters       |
+         | scores    |   | realtime tickets          |
+         | snapshots |   | username cache            |
+         +-----------+   +---------------------------+
+          source of            derived, disposable
+            truth            (rebuild restores it all)
+```
+
+Every arrow into Redis is one-way: nothing there is authoritative, and `admin
+rebuild-leaderboards` reconstructs all of it from `score_events`.
+
+## Metrics
+
+```
+GET /metrics          on the API
+GET :9100/metrics     on the worker, which serves nothing else
+```
+
+| Metric | Why it is here |
+|---|---|
+| `podium_http_requests_total{method,route,status}` | traffic and error rate |
+| `podium_http_request_duration_seconds{method,route}` | latency, bucketed for this API |
+| `podium_projection_pending` | **the one to alert on** - scores recorded but not yet visible |
+| `podium_scores_recorded_total{game}` | real throughput, per game |
+| `podium_score_points{game}` | whether a game's scoring curve is sane in practice |
+| `podium_realtime_connections` | sockets held on this instance |
+| `podium_realtime_dropped_total` | subscribers evicted for falling behind |
+
+**The `route` label is chi's pattern, never the path.** Labelling by path would mint a series per
+session id - one endpoint becoming millions of series, which nothing downstream can absorb.
+Unmatched paths all collapse to a single `unmatched` label, so scanning for `/wp-admin.php`
+cannot add a series per probe. Both are tested.
+
+Collectors live on their own registry rather than the global default, because two instances in
+one process - which every integration test builds - would otherwise collide on registration.
+
+## Load
+
+```bash
+docker run --rm -i --network host grafana/k6 run - < tests/load/k6.js
+```
+
+Weighted towards the **write** path on purpose. Hammering `GET /v1/leaderboards` measures one
+`ZREVRANGE` and proves nothing; what is worth knowing is the cost of the path that takes a row
+lock, runs the Lua script across eight keys and publishes a notification.
+
+25 players opening and finishing sessions, 10 anonymous readers, 5 held sockets, for 70 seconds
+on one laptop running the whole stack in Docker:
+
+| | p95 | avg |
+|---|---|---|
+| finish a session (transaction + Lua + publish) | **6 ms** | 4.2 ms |
+| read a leaderboard page | **4 ms** | 2.2 ms |
+| all HTTP | **5.2 ms** | 3.3 ms |
+
+```
+686 scores recorded · 290 snapshots pushed to sockets · 0.00% failed · 2072/2072 checks passed
+```
+
+Cross-checked against the API's own counters afterwards: `podium_projected_total 2` against 2771
+scores. The projector is a safety net, not the main path - almost everything published inline.
+
+**Two things the first run taught me, both the load script's fault rather than the server's:**
+
+The naive version registered an account per iteration. Every k6 VU shares one address, so the
+per-IP registration cap correctly refused nearly all of it - 728k requests, 99.9% rejected,
+15 scores. The limiter was working; the script was measuring it.
+
+The second version shared a pool of accounts and got 1.88% errors, all
+`409 this session has already ended`. Two VUs on one account both open a memory session, and
+starting one **abandons** the other - one live session per game per player, by design. Now each VU
+owns an account.
+
+Limits are raised for the run via `compose.load.yaml`, because all traffic comes from one host.
+The limiter itself is covered by tests rather than by this.
 
 ## The demo page
 
@@ -1028,7 +1124,7 @@ and the headline number becomes fiction.
 | 6 | Realtime — WebSockets, Pub/Sub fan-out, coalescing, slow-client eviction | done |
 | 7 | Reports and rate limiting — hot and cold period reports, token buckets | done |
 | 8 | Demo UI — play all five games, watch ranks reorder live | done |
-| 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | next |
+| 9 | Production — metrics, OpenAPI, load test results, deployment on two instances | done |
 
 ## Layout
 
@@ -1047,6 +1143,9 @@ internal/projector/          the sweep that heals unprojected scores
 internal/realtime/           hub, Pub/Sub bridge, tickets, WebSocket endpoint
 internal/reports/            period reports across Redis, snapshots and history
 internal/web/                the demo page, embedded in the binary
+api/openapi.yaml             the API description
+tests/load/k6.js             the load profile
+deploy/                      Fly.io configuration
 internal/config/             environment configuration, validated at boot
 internal/httpapi/            router, middleware, error envelope, handlers, probes
 internal/ratelimit/          Redis fixed-window counters

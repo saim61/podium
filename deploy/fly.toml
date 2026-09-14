@@ -1,0 +1,72 @@
+app = "podium"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[env]
+  PODIUM_ENV = "prod"
+  PODIUM_HTTP_ADDR = ":8080"
+  PODIUM_LOG_FORMAT = "json"
+
+  # Fly terminates TLS and forwards, so the peer address is the proxy. Without this every
+  # request looks like it came from one client and per-IP limits protect nothing.
+  PODIUM_TRUST_PROXY_IP = "true"
+
+# Secrets, set out of band and never in this file:
+#   fly secrets set PODIUM_JWT_SECRET=$(openssl rand -base64 48)
+#   fly secrets set PODIUM_DATABASE_URL=...
+#   fly secrets set PODIUM_REDIS_URL=...
+
+[processes]
+  app = "api"
+  worker = "worker"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  processes = ["app"]
+
+  # Sockets are held for as long as a page is open, so the machine must not be stopped under
+  # them. Scaling to zero would disconnect every watcher whenever play went quiet.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 2
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+[[http_service.checks]]
+  # Readiness, not liveness: this decides whether a machine receives traffic, so it should fail
+  # while a dependency is unreachable.
+  path = "/readyz"
+  interval = "10s"
+  timeout = "2s"
+  grace_period = "10s"
+
+[checks.alive]
+  # Liveness is the one that restarts a machine, so it must touch nothing but the process.
+  type = "http"
+  port = 8080
+  path = "/healthz"
+  interval = "30s"
+  timeout = "5s"
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["worker"]
+
+# Migrations run once per deploy, before any machine serves traffic. Running them from the API's
+# startup instead would have every replica racing on the version table.
+[deploy]
+  release_command = "migrate"
+  strategy = "rolling"

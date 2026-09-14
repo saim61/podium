@@ -44,6 +44,8 @@ func run() error {
 	log := observability.NewLogger(cfg.Log, os.Stdout)
 	slog.SetDefault(log)
 
+	metrics := observability.NewMetrics()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -82,7 +84,7 @@ func run() error {
 		return err
 	}
 
-	hub := realtime.NewHub(board, cfg.Realtime, log)
+	hub := realtime.NewHub(board, cfg.Realtime, log, realtime.WithHubMetrics(metrics))
 	bridge := realtime.NewBridge(rdb, hub, registry, log)
 	tickets := realtime.NewTickets(rdb, cfg.Realtime, cfg.Redis.OpTimeout)
 
@@ -92,6 +94,7 @@ func run() error {
 
 	sessions := session.NewService(pool, registry,
 		session.WithProjector(board),
+		session.WithMetrics(metrics),
 		session.WithProjectTimeout(cfg.Redis.OpTimeout))
 
 	demo, err := web.Handler()
@@ -105,10 +108,11 @@ func run() error {
 		Auth:        authService,
 		Sessions:    sessions,
 		Leaderboard: board,
-		Realtime:    realtime.NewServer(hub, tickets, registry, cfg.Realtime, log),
+		Realtime:    realtime.NewServer(hub, tickets, registry, cfg.Realtime, log, realtime.WithServerMetrics(metrics)),
 		Tickets:     tickets,
 		Reports:     reports.NewService(pool, board, registry),
 		Web:         demo,
+		Metrics:     metrics,
 		Limiter:     limiter,
 		Checks: []httpapi.Check{
 			{Name: "postgres", Probe: pool.Ping},

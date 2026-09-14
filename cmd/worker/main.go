@@ -14,6 +14,7 @@ import (
 
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/games"
+	"github.com/saim61/podium/internal/httpapi"
 	"github.com/saim61/podium/internal/leaderboard"
 	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/platform/postgres"
@@ -43,6 +44,8 @@ func run() error {
 	log := observability.NewLogger(cfg.Log, os.Stdout)
 	slog.SetDefault(log)
 
+	metrics := observability.NewMetrics()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -70,10 +73,17 @@ func run() error {
 
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return projector.New(store, board, cfg.Worker, log).Run(groupCtx)
+		return projector.New(store, board, cfg.Worker, log, projector.WithMetrics(metrics)).Run(groupCtx)
 	})
 	group.Go(func() error {
 		return projector.NewHousekeeper(store, cfg.Worker, log, reporter).Run(groupCtx)
+	})
+
+	// The worker serves nothing else, so its metrics need their own listener for a scraper to
+	// reach. Without this the projection backlog - the number most worth alerting on - would be
+	// invisible.
+	group.Go(func() error {
+		return httpapi.ServeMetrics(groupCtx, cfg.Worker.MetricsAddr, log, metrics)
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {

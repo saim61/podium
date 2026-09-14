@@ -75,6 +75,7 @@ type Worker struct {
 	ProjectorBatch       int
 	HousekeepingInterval time.Duration
 	SessionMaxAge        time.Duration
+	MetricsAddr          string
 }
 
 // Argon2 holds the password hashing cost. Values are recorded in every hash, so raising them
@@ -200,6 +201,7 @@ func Load() (Config, error) {
 			ProjectorBatch:       l.intRange("PROJECTOR_BATCH", 200, 1, 10000),
 			HousekeepingInterval: l.duration("HOUSEKEEPING_INTERVAL", time.Hour),
 			SessionMaxAge:        l.duration("SESSION_MAX_AGE", 2*time.Hour),
+			MetricsAddr:          l.str("WORKER_METRICS_ADDR", ":9100"),
 		},
 	}
 

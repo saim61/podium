@@ -10,6 +10,7 @@ import (
 
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/leaderboard"
+	"github.com/saim61/podium/internal/platform/observability"
 )
 
 // Boards is the read side of the leaderboards a snapshot comes from.
@@ -51,19 +52,28 @@ func (s *subscriber) deliver(frame []byte) bool {
 
 // Hub tracks who is subscribed to what and broadcasts snapshots.
 type Hub struct {
-	boards Boards
-	cfg    config.Realtime
-	log    *slog.Logger
-	now    func() time.Time
+	boards  Boards
+	cfg     config.Realtime
+	log     *slog.Logger
+	metrics *observability.Metrics
+	now     func() time.Time
 
 	mu       sync.Mutex
 	channels map[string]map[*subscriber]struct{}
 	dirty    map[string]Channel
 }
 
+// HubOption adjusts a Hub.
+type HubOption func(*Hub)
+
+// WithHubMetrics attaches the collectors fan-out activity is counted into.
+func WithHubMetrics(m *observability.Metrics) HubOption {
+	return func(h *Hub) { h.metrics = m }
+}
+
 // NewHub builds a hub.
-func NewHub(boards Boards, cfg config.Realtime, log *slog.Logger) *Hub {
-	return &Hub{
+func NewHub(boards Boards, cfg config.Realtime, log *slog.Logger, opts ...HubOption) *Hub {
+	h := &Hub{
 		boards:   boards,
 		cfg:      cfg,
 		log:      log,
@@ -71,6 +81,10 @@ func NewHub(boards Boards, cfg config.Realtime, log *slog.Logger) *Hub {
 		channels: map[string]map[*subscriber]struct{}{},
 		dirty:    map[string]Channel{},
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // Subscribe adds a subscriber to a channel.
@@ -227,12 +241,19 @@ func (h *Hub) broadcast(channel Channel, frame []byte) {
 
 	dropped := 0
 	for _, sub := range subs {
-		if !sub.deliver(frame) {
-			dropped++
+		if sub.deliver(frame) {
+			if h.metrics != nil {
+				h.metrics.RealtimeFrames.Inc()
+			}
+			continue
 		}
+		dropped++
 	}
 
 	if dropped > 0 {
+		if h.metrics != nil {
+			h.metrics.RealtimeDropped.Add(float64(dropped))
+		}
 		h.log.Warn("dropped subscribers that could not keep up",
 			slog.String("channel", channel.String()),
 			slog.Int("count", dropped))

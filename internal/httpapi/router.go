@@ -10,6 +10,7 @@ import (
 	"github.com/saim61/podium/internal/auth"
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/leaderboard"
+	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/ratelimit"
 	"github.com/saim61/podium/internal/realtime"
 	"github.com/saim61/podium/internal/reports"
@@ -27,6 +28,7 @@ type Deps struct {
 	Tickets     *realtime.Tickets
 	Reports     *reports.Service
 	Web         http.Handler
+	Metrics     *observability.Metrics
 	Limiter     *ratelimit.Limiter
 	Now         func() time.Time
 }
@@ -40,6 +42,9 @@ func NewRouter(d Deps) http.Handler {
 
 	r.Use(RequestID)
 	r.Use(Logger(d.Logger))
+	if d.Metrics != nil {
+		r.Use(Measure(d.Metrics))
+	}
 	r.Use(Recoverer)
 	r.Use(MaxBody(DefaultMaxBodyBytes))
 
@@ -50,6 +55,12 @@ func NewRouter(d Deps) http.Handler {
 		WriteError(w, r, newError(http.StatusMethodNotAllowed, "method_not_allowed",
 			"that method is not allowed on this endpoint"))
 	})
+
+	if d.Metrics != nil {
+		// Unauthenticated on purpose: a scraper is infrastructure, not a user, and reaching it
+		// is normally controlled by not exposing the port rather than by a credential.
+		r.Handle("/metrics", d.Metrics.Handler())
+	}
 
 	r.Get("/healthz", handleLive())
 	r.Get("/readyz", handleReady(d.Checks, !d.Config.IsProd()))

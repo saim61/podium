@@ -1,0 +1,737 @@
+openapi: 3.1.0
+
+info:
+  title: Podium
+  version: "1.0.0"
+  license:
+    name: MIT
+  description: |
+    A real-time leaderboard system. Five server-authoritative games feed per-game and cross-game
+    leaderboards built on Redis sorted sets.
+
+    **There is no endpoint that accepts a score.** A score is produced by playing a session
+    through: the server holds the game state, validates every move, enforces the deadline on its
+    own clock, and computes the result. That absence is the whole anti-forgery argument, which is
+    why it is stated here rather than left to be inferred.
+
+servers:
+  - url: http://localhost:8080
+    description: Local compose stack
+
+tags:
+  - name: auth
+    description: Accounts, sign-in, and refresh tokens that rotate on every use.
+  - name: games
+    description: The five games and their rules. Public - no account needed to read them.
+  - name: sessions
+    description: Playing. The server owns the game state; a session is the only way a score exists.
+  - name: leaderboards
+    description: Per-game and cross-game rankings, served from Redis sorted sets.
+  - name: reports
+    description: Who led a given window, answered from whichever store still holds it.
+  - name: realtime
+    description: WebSocket fan-out of leaderboard changes, fanned across instances by Redis Pub/Sub.
+  - name: operations
+    description: Probes and metrics. Meant for orchestrators and scrapers, not for users.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [operations]
+      summary: Liveness
+      description: Always 200 while the process runs. Touches no dependency, so a database blip
+        cannot restart every replica at once.
+      security: []
+      responses:
+        "200":
+          description: The process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+
+  /readyz:
+    get:
+      tags: [operations]
+      summary: Readiness
+      description: Probes each dependency in parallel. Dependency error text is included in
+        `dev` and withheld in `prod`, where it would be free reconnaissance.
+      security: []
+      responses:
+        "200": { description: Every dependency answered }
+        "503":
+          description: At least one dependency is unreachable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
+  /metrics:
+    get:
+      tags: [operations]
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200":
+          description: Metrics in Prometheus text format
+          content:
+            text/plain: { schema: { type: string } }
+
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account and sign in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, email, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 32
+                  pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+                email: { type: string, format: email, maxLength: 254 }
+                password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "201":
+          description: Account created and signed in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Username or email already registered, compared case-insensitively
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in with a username or email
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [login, password]
+              properties:
+                login:
+                  type: string
+                  description: Username or email, matched case-insensitively
+                password: { type: string }
+      responses:
+        "200":
+          description: Signed in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResult" }
+        "401":
+          description: |
+            Invalid credentials. An unknown account and a wrong password return the identical
+            message and take comparable time, so this endpoint cannot be used to discover which
+            usernames exist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Exchange a refresh token for a new pair
+      description: |
+        Refresh tokens are single use and rotate on every exchange. Presenting one twice means two
+        parties hold it, so the entire token family is revoked and both are signed out.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: A new token pair
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tokens" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Token unknown, expired, revoked, or already used
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke a session
+      description: |
+        Revokes the refresh family. The access token is a signed JWT and cannot be un-issued, so
+        it stays valid until it expires - fifteen minutes by default.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "204": { description: "Session revoked, or the token was already unknown" }
+
+  /v1/me:
+    get:
+      tags: [auth]
+      summary: The signed-in account
+      responses:
+        "200":
+          description: The account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/games:
+    get:
+      tags: [games]
+      summary: Every game, with its rules and scoring
+      security: []
+      responses:
+        "200":
+          description: The five games
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  games:
+                    type: array
+                    items: { $ref: "#/components/schemas/Game" }
+
+  /v1/games/{slug}:
+    get:
+      tags: [games]
+      summary: One game
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/GameSlug" }
+      responses:
+        "200":
+          description: The game
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Game" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/games/{slug}/sessions:
+    post:
+      tags: [sessions]
+      summary: Open a session
+      description: |
+        Any session already open for the same game is abandoned, which bounds a player to one live
+        session per game.
+      parameters:
+        - { $ref: "#/components/parameters/GameSlug" }
+      responses:
+        "201":
+          description: Session opened
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/sessions/{id}:
+    get:
+      tags: [sessions]
+      summary: A session's current state
+      parameters:
+        - { $ref: "#/components/parameters/SessionID" }
+      responses:
+        "200":
+          description: The session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: |
+            No such session. Another player's session also answers 404 rather than 403, because a
+            distinct status would confirm the id exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/sessions/{id}/moves:
+    post:
+      tags: [sessions]
+      summary: Play a move
+      description: |
+        The move body differs per game and is validated by that game's engine:
+
+        | Game | Body |
+        |---|---|
+        | `reaction` | `{"action":"arm"}` then `{"action":"tap"}` |
+        | `math-sprint` | `{"answer":42}` |
+        | `memory` | `{"answer":[3,1,4]}` |
+        | `word-scramble` | `{"answer":"planet"}` or `{"skip":true}` |
+        | `number-guess` | `{"guess":50}` |
+
+        `arm` is held open for 1.2 to 3 seconds: the arrival of that response *is* the signal, so
+        a client cannot learn when it is due and schedule a perfect tap.
+      parameters:
+        - { $ref: "#/components/parameters/SessionID" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Per-game move, see above
+      responses:
+        "200":
+          description: Move applied
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400":
+          description: The move is not valid for this game
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The session has ended, or its time limit has passed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/sessions/{id}/finish:
+    post:
+      tags: [sessions]
+      summary: End a session and record its score
+      description: |
+        Idempotent. Finishing twice returns the score already stored rather than writing a second
+        one. Rounds never played are charged their worst value, so quitting early cannot beat
+        playing badly.
+      parameters:
+        - { $ref: "#/components/parameters/SessionID" }
+      responses:
+        "200":
+          description: Finished, with the score and where it placed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/leaderboards/global:
+    get:
+      tags: [leaderboards]
+      summary: The cross-game board
+      description: |
+        A player's global score is the **sum of their best points across all five games**, so it
+        rewards breadth rather than mastery of one.
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/Period" }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Offset" }
+      responses:
+        "200":
+          description: A page of the board
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Page" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/leaderboards/{game}:
+    get:
+      tags: [leaderboards]
+      summary: One game's board
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/GameName" }
+        - { $ref: "#/components/parameters/Period" }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Offset" }
+      responses:
+        "200":
+          description: A page of the board
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Page" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/leaderboards/global/me:
+    get:
+      tags: [leaderboards]
+      summary: Your place on the cross-game board
+      parameters:
+        - { $ref: "#/components/parameters/Period" }
+        - { $ref: "#/components/parameters/Neighbours" }
+      responses:
+        "200":
+          description: |
+            Your standing. A player with no score in the window is unranked, which is a normal
+            state and returns 200 with a zero rank rather than 404.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Standing" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/leaderboards/{game}/me:
+    get:
+      tags: [leaderboards]
+      summary: Your place on one game's board
+      parameters:
+        - { $ref: "#/components/parameters/GameName" }
+        - { $ref: "#/components/parameters/Period" }
+        - { $ref: "#/components/parameters/Neighbours" }
+      responses:
+        "200":
+          description: Your standing
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Standing" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/reports/top-players:
+    get:
+      tags: [reports]
+      summary: The leading players of a window
+      description: |
+        Answered from whichever store still holds the window, reported in `source`:
+
+        - `live` - Redis still has the sorted set
+        - `snapshot` - the window closed and was frozen into one row
+        - `history` - aggregated from the score history on demand
+
+        All three produce identical rankings; only the cost differs.
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/Period" }
+        - name: date
+          in: query
+          description: Any date inside the window. Defaults to now.
+          schema: { type: string, format: date, examples: ["2026-09-09"] }
+        - name: game
+          in: query
+          description: Omit for the cross-game board.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      responses:
+        "200":
+          description: The report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/realtime/ticket:
+    post:
+      tags: [realtime]
+      summary: Mint a WebSocket handshake credential
+      description: |
+        A browser cannot set an `Authorization` header on a WebSocket handshake, and a token in
+        the query string is written into every access log on the way. This returns a 30 second,
+        single-use ticket that the handshake spends instead.
+      responses:
+        "201":
+          description: A ticket
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket: { type: string }
+                  expires_in: { type: integer, description: Seconds }
+                  url: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/ws:
+    get:
+      tags: [realtime]
+      summary: Leaderboard updates over WebSocket
+      description: |
+        Upgrade with `?ticket=...`. Then subscribe:
+
+        ```json
+        {"op":"subscribe","channels":["memory:daily","global:all-time"]}
+        ```
+
+        The server replies with a snapshot at once, then a fresh one whenever the board changes,
+        coalesced to at most one frame per channel per flush interval. A connection that cannot
+        keep up is dropped rather than allowed to stall the fan-out for everyone else.
+      security: []
+      parameters:
+        - name: ticket
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "101": { description: Switching protocols }
+        "401": { description: "Missing, expired or already-spent ticket" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    GameSlug:
+      name: slug
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [reaction, math-sprint, memory, word-scramble, number-guess]
+    GameName:
+      name: game
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [reaction, math-sprint, memory, word-scramble, number-guess]
+    SessionID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Period:
+      name: period
+      in: query
+      schema:
+        type: string
+        enum: [all-time, daily, weekly, monthly]
+        default: all-time
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    Neighbours:
+      name: neighbours
+      in: query
+      description: How many players to include either side of you.
+      schema: { type: integer, minimum: 0, maximum: 25, default: 2 }
+
+  responses:
+    BadRequest:
+      description: The request is malformed or invalid
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such resource
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema: { type: integer }
+        RateLimit-Limit:
+          schema: { type: integer }
+        RateLimit-Remaining:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      description: |
+        Every failure uses this one envelope. Unexpected errors return a fixed message and the
+        real cause goes to the logs, because error strings routinely contain connection strings
+        and query fragments.
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum: [bad_request, unauthorized, forbidden, not_found, conflict,
+                     method_not_allowed, rate_limited, unavailable, internal]
+            message: { type: string }
+            fields:
+              type: object
+              description: Per-field validation detail, when the failure is a validation failure
+              additionalProperties: { type: string }
+            request_id:
+              type: string
+              description: Also returned in the X-Request-Id header and attached to every log line
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, error] }
+              error: { type: string, description: Present in dev only }
+
+    User:
+      type: object
+      description: The numeric account id is never exposed; leaderboards identify people by username.
+      properties:
+        username: { type: string }
+        email: { type: string, format: email }
+        created_at: { type: string, format: date-time }
+
+    Tokens:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, description: Seconds }
+        refresh_token: { type: string }
+        refresh_expires_in: { type: integer, description: Seconds }
+
+    AuthResult:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        tokens: { $ref: "#/components/schemas/Tokens" }
+
+    Game:
+      type: object
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        summary: { type: string }
+        rules: { type: array, items: { type: string } }
+        metric: { type: string, examples: ["milliseconds", "correct answers"] }
+        lower_is_better: { type: boolean }
+        duration_seconds: { type: integer, description: Omitted for games with no time limit }
+        max_points: { type: integer, const: 10000 }
+
+    Score:
+      type: object
+      properties:
+        game: { type: string }
+        metric: { type: string }
+        raw: { type: number, description: "The game's own metric, in its own units" }
+        points: { type: integer, minimum: 0, maximum: 10000 }
+        achieved_at: { type: string, format: date-time }
+
+    Standing:
+      type: object
+      properties:
+        scope: { type: string }
+        period: { type: string }
+        rank: { type: integer }
+        points: { type: integer }
+        total: { type: integer, description: How many players are ranked }
+        neighbours: { type: array, items: { $ref: "#/components/schemas/Entry" } }
+
+    Placement:
+      type: object
+      description: Where a finished score landed, per period.
+      properties:
+        improved: { type: boolean }
+        game:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              points: { type: integer }
+              rank: { type: integer }
+        global:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              points: { type: integer }
+              rank: { type: integer }
+
+    Session:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        game: { type: string }
+        status: { type: string, enum: [active, finished, abandoned] }
+        moves: { type: integer }
+        started_at: { type: string, format: date-time }
+        deadline_at: { type: string, format: date-time }
+        state:
+          type: object
+          description: |
+            The game's **view** - the projection a client is allowed to see. Never the private
+            state, which holds the answers.
+        score: { $ref: "#/components/schemas/Score" }
+        placement: { $ref: "#/components/schemas/Placement" }
+
+    Entry:
+      type: object
+      properties:
+        rank:
+          type: integer
+          description: |
+            Competition rank: everyone on the same score shares a rank, and the next distinct
+            score skips the places they occupy - 1, 2, 2, 4.
+        username: { type: string }
+        points: { type: integer }
+
+    Page:
+      type: object
+      properties:
+        scope: { type: string }
+        period: { type: string }
+        total: { type: integer }
+        offset: { type: integer }
+        entries: { type: array, items: { $ref: "#/components/schemas/Entry" } }
+
+    Report:
+      type: object
+      properties:
+        scope: { type: string }
+        period: { type: string }
+        from: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        source: { type: string, enum: [live, snapshot, history] }
+        players: { type: integer }
+        entries: { type: array, items: { $ref: "#/components/schemas/Entry" } }

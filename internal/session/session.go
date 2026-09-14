@@ -69,6 +69,7 @@ type Service struct {
 	queries        *db.Queries
 	registry       *games.Registry
 	projector      Projector
+	metrics        *observability.Metrics
 	projectTimeout time.Duration
 	now            func() time.Time
 	sleep          func(ctx context.Context, until time.Time) error
@@ -85,6 +86,11 @@ func WithClock(now func() time.Time) Option {
 // WithProjector attaches the leaderboards a finished score is published to.
 func WithProjector(p Projector) Option {
 	return func(s *Service) { s.projector = p }
+}
+
+// WithMetrics attaches the collectors session activity is counted into.
+func WithMetrics(m *observability.Metrics) Option {
+	return func(s *Service) { s.metrics = m }
 }
 
 // WithProjectTimeout bounds how long the inline projection may take. A Redis outage must cost a
@@ -189,6 +195,9 @@ func (s *Service) Start(ctx context.Context, userID int64, slug games.Slug) (Ses
 		return Session{}, fmt.Errorf("commit session: %w", err)
 	}
 
+	if s.metrics != nil {
+		s.metrics.SessionsStarted.WithLabelValues(string(slug)).Inc()
+	}
 	return sessionFrom(row, view, nil), nil
 }
 
@@ -422,6 +431,10 @@ func (s *Service) settle(
 		return finished, nil, fmt.Errorf("record score: %w", err)
 	}
 
+	if s.metrics != nil {
+		s.metrics.ScoresRecorded.WithLabelValues(row.Game).Inc()
+		s.metrics.ScorePoints.WithLabelValues(row.Game).Observe(float64(event.Points))
+	}
 	return finished, scoreFrom(event, definition), nil
 }
 

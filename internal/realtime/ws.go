@@ -12,6 +12,7 @@ import (
 
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/games"
+	"github.com/saim61/podium/internal/platform/observability"
 )
 
 // clientMessage is what a client may send.
@@ -38,11 +39,24 @@ type Server struct {
 	registry *games.Registry
 	cfg      config.Realtime
 	log      *slog.Logger
+	metrics  *observability.Metrics
+}
+
+// ServerOption adjusts a Server.
+type ServerOption func(*Server)
+
+// WithServerMetrics attaches the collectors connection counts go into.
+func WithServerMetrics(m *observability.Metrics) ServerOption {
+	return func(s *Server) { s.metrics = m }
 }
 
 // NewServer builds the WebSocket endpoint.
-func NewServer(hub *Hub, tickets *Tickets, registry *games.Registry, cfg config.Realtime, log *slog.Logger) *Server {
-	return &Server{hub: hub, tickets: tickets, registry: registry, cfg: cfg, log: log}
+func NewServer(hub *Hub, tickets *Tickets, registry *games.Registry, cfg config.Realtime, log *slog.Logger, opts ...ServerOption) *Server {
+	s := &Server{hub: hub, tickets: tickets, registry: registry, cfg: cfg, log: log}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler upgrades and serves one connection.
@@ -82,6 +96,11 @@ func (s *Server) serve(ctx context.Context, conn *websocket.Conn, userID int64) 
 		drop: cancel,
 	}
 	defer s.hub.Remove(sub)
+
+	if s.metrics != nil {
+		s.metrics.RealtimeConnections.Inc()
+		defer s.metrics.RealtimeConnections.Dec()
+	}
 
 	log := s.log.With(slog.Int64("user_id", userID))
 

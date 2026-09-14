@@ -11,6 +11,7 @@ import (
 	"github.com/saim61/podium/internal/config"
 	"github.com/saim61/podium/internal/games"
 	"github.com/saim61/podium/internal/leaderboard"
+	"github.com/saim61/podium/internal/platform/observability"
 	"github.com/saim61/podium/internal/reports"
 	"github.com/saim61/podium/internal/scores"
 )
@@ -27,15 +28,28 @@ type Board interface {
 // between the commit and the publish. Without it those scores would be durably recorded and
 // permanently invisible, which is the failure mode that quietly turns a leaderboard into a lie.
 type Projector struct {
-	store *scores.Store
-	board Board
-	cfg   config.Worker
-	log   *slog.Logger
+	store   *scores.Store
+	board   Board
+	cfg     config.Worker
+	log     *slog.Logger
+	metrics *observability.Metrics
+}
+
+// Option adjusts a Projector.
+type Option func(*Projector)
+
+// WithMetrics attaches the collectors projection progress is reported through.
+func WithMetrics(m *observability.Metrics) Option {
+	return func(p *Projector) { p.metrics = m }
 }
 
 // New builds a projector.
-func New(store *scores.Store, board Board, cfg config.Worker, log *slog.Logger) *Projector {
-	return &Projector{store: store, board: board, cfg: cfg, log: log}
+func New(store *scores.Store, board Board, cfg config.Worker, log *slog.Logger, opts ...Option) *Projector {
+	p := &Projector{store: store, board: board, cfg: cfg, log: log}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Run sweeps on a ticker until the context is cancelled.
@@ -83,6 +97,12 @@ func (p *Projector) Sweep(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// Reported before the work, so a growing backlog is visible while it is growing rather than
+	// only once it has been cleared.
+	if p.metrics != nil {
+		p.metrics.ProjectionPending.Set(float64(len(pending)))
+	}
+
 	projected := 0
 	for _, event := range pending {
 		if _, err := p.board.Submit(ctx, event.UserID, event.Game, event.Points, event.AchievedAt); err != nil {
@@ -95,6 +115,11 @@ func (p *Projector) Sweep(ctx context.Context) (int, error) {
 			return projected, err
 		}
 		projected++
+
+		if p.metrics != nil {
+			p.metrics.ProjectedTotal.Inc()
+			p.metrics.ProjectionPending.Set(float64(len(pending) - projected))
+		}
 	}
 	return projected, nil
 }
